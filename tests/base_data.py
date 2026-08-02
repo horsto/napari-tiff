@@ -1,9 +1,14 @@
 import os
 import zipfile
+from pathlib import Path
 
 import numpy as np
 import pytest
 import tifffile
+
+SCANIMAGE_DATA_DIR = Path(__file__).parent / "data" / "scanimage"
+SCANIMAGE_SOFTWARE_SINGLE = (SCANIMAGE_DATA_DIR / "software_single.txt").read_text()
+SCANIMAGE_SOFTWARE_SPLIT = (SCANIMAGE_DATA_DIR / "software_split.txt").read_text()
 
 
 def example_data_filepath(tmp_path, original_data):
@@ -81,6 +86,87 @@ def imagej_hyperstack_image(tmp_path_factory):
         metadata=metadata,
     )
     return (filename, metadata)
+
+
+def _scanimage_frame_description(frame_number: int) -> str:
+    """Return a minimal, but realistically-formatted, ScanImage per-page description."""
+    return (
+        f"frameNumbers = {frame_number}\n"
+        "acquisitionNumbers = 1\n"
+        f"frameNumberAcquisition = {frame_number}\n"
+        f"frameTimestamps_sec = {frame_number * 0.0333:.9f}\n"
+    )
+
+
+def write_scanimage_tiff(
+    path,
+    software: str,
+    n_pages: int,
+    start_frame_number: int = 1,
+    shape=(4, 4),
+    dtype=np.int16,
+):
+    """Write a small, synthetic-but-realistic ScanImage-like BigTIFF file.
+
+    Embeds real ScanImage `Software` tag content (captured from an actual
+    acquisition) so `tifffile.is_scanimage`/`scanimage_metadata` parsing
+    behaves exactly as on real files. `metadata=None` disables tifffile's
+    own "shaped" JSON description, which would otherwise take priority over
+    ScanImage detection when building `TiffFile.series`.
+    """
+    data = np.random.randint(0, 2**14, (n_pages,) + shape).astype(dtype)
+    with tifffile.TiffWriter(path, bigtiff=True) as tif:
+        for i in range(n_pages):
+            frame_number = start_frame_number + i
+            tif.write(
+                data[i],
+                software=software,
+                description=_scanimage_frame_description(frame_number),
+                contiguous=False,
+                metadata=None,
+            )
+    return path, data
+
+
+@pytest.fixture
+def scanimage_timeseries_tiff(tmp_path):
+    """Plain (non-volumetric) ScanImage timeseries: `hStackManager.enable=False`."""
+    path = tmp_path / "scanimage_single_00001.tif"
+    path, data = write_scanimage_tiff(path, SCANIMAGE_SOFTWARE_SINGLE, n_pages=6)
+    return str(path), data
+
+
+@pytest.fixture
+def scanimage_volumetric_tiff(tmp_path):
+    """Volumetric ScanImage timeseries with a flyback frame per volume.
+
+    `actualNumSlices=3`, `numFramesPerVolumeWithFlyback=4`: 2 volumes are
+    written as 8 on-disk pages (frames 4 and 8 are the flyback frames to be
+    dropped).
+    """
+    path = tmp_path / "scanimage_vol_00001.tif"
+    path, data = write_scanimage_tiff(path, SCANIMAGE_SOFTWARE_SPLIT, n_pages=8)
+    return str(path), data
+
+
+@pytest.fixture
+def scanimage_split_files(tmp_path):
+    """A 3-file split volumetric ScanImage acquisition, naturally-ordered.
+
+    Mirrors the real `<base>_<acquisition>_<fileIndex>.tif` naming
+    convention: 2 volumes (8 pages) per file, with `frameNumbers`
+    contiguous across file boundaries (1-8, 9-16, 17-24).
+    """
+    paths = []
+    datas = []
+    for i, start in enumerate((1, 9, 17), start=1):
+        path = tmp_path / f"scanimage_split_00001_0000{i}.tif"
+        path, data = write_scanimage_tiff(
+            path, SCANIMAGE_SOFTWARE_SPLIT, n_pages=8, start_frame_number=start
+        )
+        paths.append(str(path))
+        datas.append(data)
+    return paths, datas
 
 
 @pytest.fixture

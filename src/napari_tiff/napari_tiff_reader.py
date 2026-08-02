@@ -15,6 +15,19 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 from tifffile import TIFF, TiffFile, TiffSequence
 
 from napari_tiff.napari_tiff_metadata import get_metadata
+from napari_tiff.napari_tiff_multifile import (
+    build_multifile_layerdata,
+    check_compatible,
+    get_multifile_metadata,
+    natural_sort,
+)
+from napari_tiff.napari_tiff_scanimage import (
+    build_scanimage_layerdata,
+    compute_scanimage_dimensions,
+    find_scanimage_series_files,
+    get_scanimage_framedata,
+    warn_on_frame_number_gaps,
+)
 
 LayerData = Union[Tuple[Any], Tuple[Any, Dict], Tuple[Any, Dict, str]]
 PathLike = Union[str, List[str]]
@@ -35,18 +48,25 @@ def napari_get_reader(path: PathLike) -> Optional[ReaderFunction]:
         If the path is a recognized format, return a function that accepts the
         same path or list of paths, and returns a list of layer data tuples.
     """
-    if isinstance(path, list):
-        # reader plugins may be handed single path, or a list of paths.
-        # if it is a list, it is assumed to be an image stack...
-        # so we are only going to look at the first file.
-        path = path[0]
-    path = path.lower()
-    if path.endswith("zip"):
+    paths = path if isinstance(path, list) else [path]
+    first_path = paths[0]
+    first_path_lower = first_path.lower()
+    if first_path_lower.endswith("zip"):
         return zip_reader
-    for ext in TIFF.FILE_EXTENSIONS:
-        if path.endswith(ext):
-            return reader_function
-    return None
+    if not any(first_path_lower.endswith(ext) for ext in TIFF.FILE_EXTENSIONS):
+        return None
+
+    try:
+        with TiffFile(first_path) as tif:
+            is_scanimage = tif.is_scanimage
+    except Exception:
+        is_scanimage = False
+
+    if is_scanimage:
+        return scanimage_reader_function
+    if len(paths) > 1:
+        return multifile_reader_function
+    return reader_function
 
 
 def reader_function(path: PathLike) -> List[LayerData]:
@@ -60,6 +80,64 @@ def reader_function(path: PathLike) -> List[LayerData]:
             log_warning(f"tifffile: {exc}")
             layerdata = imagecodecs_reader(path)
     return layerdata
+
+
+def scanimage_reader_function(path: PathLike) -> List[LayerData]:
+    """Return napari LayerData for a ScanImage acquisition.
+
+    If `path` is a single file belonging to a split (multi-file)
+    acquisition, automatically discovers and stitches in all of its
+    sibling files. If `path` is already a list, that exact set of files
+    (which may be any subset, in any order, of a split acquisition) is
+    stitched instead, naturally sorted by file index.
+    """
+    try:
+        if isinstance(path, list):
+            paths = natural_sort([str(p) for p in path])
+            warn_on_frame_number_gaps(paths)
+        else:
+            paths = find_scanimage_series_files(str(path))
+
+        with TiffFile(paths[0]) as tif:
+            framedata = get_scanimage_framedata(tif)
+            dims = compute_scanimage_dimensions(framedata, len(tif.pages))
+            metadata_kwargs = get_metadata(tif)
+
+        data, _axes = build_scanimage_layerdata(paths, dims)
+        return [(data, metadata_kwargs, "image")]
+    except Exception as exc:
+        log_warning(f"scanimage reader: {exc}; falling back to generic tiff reader")
+        first = path[0] if isinstance(path, list) else path
+        return reader_function(first)
+
+
+def multifile_reader_function(path: PathLike) -> List[LayerData]:
+    """Return napari LayerData combining multiple (non-ScanImage) TIFF files.
+
+    Files are naturally sorted and checked for structural compatibility
+    before being combined; incompatible files are instead opened as
+    independent layers.
+    """
+    paths = natural_sort([str(p) for p in path]) if isinstance(path, list) else [str(path)]
+
+    report = check_compatible(paths)
+    if not report.compatible:
+        log_warning(f"multi-file reader: {report.reason}; opening files as independent layers")
+        layers = []
+        for p in paths:
+            layers.extend(reader_function(p))
+        return layers
+
+    try:
+        data, axes, guess = build_multifile_layerdata(paths)
+        metadata_kwargs = get_multifile_metadata(paths[0], axes, guess)
+        return [(data, metadata_kwargs, "image")]
+    except Exception as exc:
+        log_warning(f"multi-file reader: {exc}; opening files as independent layers")
+        layers = []
+        for p in paths:
+            layers.extend(reader_function(p))
+        return layers
 
 
 def zip_reader(path: PathLike) -> List[LayerData]:

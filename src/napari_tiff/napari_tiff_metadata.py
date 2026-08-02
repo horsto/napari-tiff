@@ -17,6 +17,8 @@ def get_metadata(tif: TiffFile) -> dict[str, Any]:
         metadata_kwargs = get_imagej_metadata(tif)
     elif tif.is_svs:
         metadata_kwargs = get_svs_metadata(tif)
+    elif tif.is_scanimage:
+        metadata_kwargs = get_scanimage_metadata(tif)
     else:
         metadata_kwargs = get_tiff_metadata(tif)
 
@@ -309,6 +311,66 @@ def get_svs_metadata(tif: TiffFile) -> dict[str, Any]:
     metadata_kwargs.setdefault("metadata", {}).update({"SVS_metadata": svs_metadata})
 
     return metadata_kwargs
+
+
+def get_scanimage_metadata(tif: TiffFile) -> dict[str, Any]:
+    """Return napari metadata for a ScanImage acquisition.
+
+    Derives axis labels and per-axis scale/units from ScanImage's `SI.*`
+    settings: X/Y from the standard TIFF resolution tags, time from
+    `SI.hRoiManager.scanFrameRate` (scaled up by the on-disk frames-per-group
+    for volumetric acquisitions, since `T` then represents one volume, not
+    one frame), and Z spacing from consecutive differences in
+    `SI.hStackManager.zs`. Falls back to a flat, unlabeled interpretation
+    (with a logged warning) when the volumetric structure cannot be
+    confirmed - see `napari_tiff.napari_tiff_scanimage`.
+    """
+    from napari_tiff.napari_tiff_scanimage import (
+        compute_scanimage_dimensions,
+        get_scanimage_framedata,
+        log_warning,
+    )
+
+    framedata = get_scanimage_framedata(tif)
+    dims = compute_scanimage_dimensions(framedata, len(tif.pages))
+    if dims.warning:
+        log_warning(f"ScanImage: {dims.warning}")
+
+    page = tif.pages[0]
+    xy_scale, xy_units = get_scale_and_units_from_tiff(page, "YX")
+    xy_scale = dict(zip("YX", xy_scale))
+    xy_units = dict(zip("YX", xy_units))
+
+    frame_rate = framedata.get("SI.hRoiManager.scanFrameRate")
+    zs = framedata.get("SI.hStackManager.zs")
+    z_spacing = None
+    if isinstance(zs, (list, tuple)) and len(zs) > 1:
+        diffs = [abs(b - a) for a, b in zip(zs, zs[1:])]
+        z_spacing = sum(diffs) / len(diffs)
+
+    scale = []
+    units = []
+    axis_labels = []
+    for axis in dims.axes:
+        axis_labels.append("i" if axis == "I" else axis.lower())
+        if axis in "YX":
+            scale.append(xy_scale[axis])
+            units.append(xy_units[axis])
+        elif axis == "T" and frame_rate:
+            scale.append(dims.frames_per_group / float(frame_rate))
+            units.append("s")
+        elif axis == "Z" and z_spacing is not None:
+            scale.append(z_spacing)
+            units.append("\u00b5m")
+        else:
+            scale.append(1.0)
+            units.append("pixel")
+
+    return dict(
+        axis_labels=tuple(axis_labels),
+        scale=tuple(scale),
+        units=tuple(units),
+    )
 
 
 def get_scale_and_units_from_ome(pixels: dict[str, Any], axes: str, shape: tuple[int, ...]) -> tuple[list[float], list[str]]:
