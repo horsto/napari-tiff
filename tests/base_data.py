@@ -169,6 +169,56 @@ def scanimage_split_files(tmp_path):
     return paths, datas
 
 
+def write_suite2p_output(
+    root,
+    n_planes: int = 2,
+    n_channels: int = 1,
+    n_chunks: int = 2,
+    frames_per_chunk: int = 3,
+    shape=(4, 4),
+    dtype=np.int16,
+):
+    """Write a small, synthetic suite2p output folder.
+
+    Creates `root/planeN/reg_tif[2]/chunk###.tif` for each plane/channel,
+    plus a top-level marker file, mirroring the structure suite2p writes
+    (minus the actual suite2p-internal `.npy` contents, which this plugin
+    never reads).
+    """
+    root = Path(root)
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "ops.npy").write_bytes(b"")
+
+    channel_dirs = ["reg_tif", "reg_tif2"][:n_channels]
+    data = {}  # (plane, channel) -> concatenated ground-truth array
+    for plane_idx in range(n_planes):
+        plane_dir = root / f"plane{plane_idx}"
+        for channel in channel_dirs:
+            channel_dir = plane_dir / channel
+            channel_dir.mkdir(parents=True, exist_ok=True)
+            chunks = []
+            for chunk_idx in range(n_chunks):
+                chunk = np.random.randint(0, 2**14, (frames_per_chunk,) + shape).astype(dtype)
+                tifffile.imwrite(
+                    channel_dir / f"chunk{chunk_idx:03d}.tif", chunk, photometric="minisblack"
+                )
+                chunks.append(chunk)
+            data[(plane_idx, channel)] = np.concatenate(chunks, axis=0)
+    return str(root), data
+
+
+@pytest.fixture
+def suite2p_output_dir(tmp_path):
+    """Synthetic single-channel, 2-plane suite2p output folder."""
+    return write_suite2p_output(tmp_path / "suite2p")
+
+
+@pytest.fixture
+def suite2p_output_dir_two_channels(tmp_path):
+    """Synthetic 2-channel (reg_tif + reg_tif2), 2-plane suite2p output folder."""
+    return write_suite2p_output(tmp_path / "suite2p", n_channels=2)
+
+
 @pytest.fixture
 def example_data_multiresolution(tmp_path):
     """Example multi-resolution tiff file.

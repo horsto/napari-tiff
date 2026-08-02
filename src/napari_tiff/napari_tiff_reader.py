@@ -30,6 +30,11 @@ from napari_tiff.napari_tiff_scanimage import (
     get_scanimage_framedata,
     warn_on_frame_number_gaps,
 )
+from napari_tiff.napari_tiff_suite2p import (
+    build_suite2p_layerdata,
+    get_suite2p_metadata,
+    is_suite2p_output_directory,
+)
 
 LayerData = Union[Tuple[Any], Tuple[Any, Dict], Tuple[Any, Dict, str]]
 PathLike = Union[str, List[str]]
@@ -39,10 +44,11 @@ ReaderFunction = Callable[[PathLike], List[LayerData]]
 def napari_get_reader(path: PathLike) -> Optional[ReaderFunction]:
     """Implements napari_get_reader hook specification.
 
-    Dispatches on `path`: a directory goes to `directory_reader_function`;
-    a ScanImage file (`TiffFile.is_scanimage`) to `scanimage_reader_function`;
-    more than one other TIFF to `multifile_reader_function`; otherwise the
-    plain `reader_function`.
+    Dispatches on `path`: a suite2p output folder (see `napari_tiff_suite2p`)
+    goes to `suite2p_reader_function`; any other directory goes to
+    `directory_reader_function`; a ScanImage file (`TiffFile.is_scanimage`)
+    to `scanimage_reader_function`; more than one other TIFF to
+    `multifile_reader_function`; otherwise the plain `reader_function`.
 
     `path` is only a list when napari opens files "as a stack" (`viewer.
     open(paths, stack=True)`, *File > Open Files as Stack...*, or
@@ -66,6 +72,8 @@ def napari_get_reader(path: PathLike) -> Optional[ReaderFunction]:
     first_path = paths[0]
 
     if len(paths) == 1 and os.path.isdir(first_path):
+        if is_suite2p_output_directory(first_path):
+            return suite2p_reader_function
         return directory_reader_function if list_tiff_files_in_directory(first_path) else None
 
     first_path_lower = first_path.lower()
@@ -85,6 +93,19 @@ def napari_get_reader(path: PathLike) -> Optional[ReaderFunction]:
     if len(paths) > 1:
         return multifile_reader_function
     return reader_function
+
+
+def suite2p_reader_function(path: PathLike) -> List[LayerData]:
+    """Return napari LayerData for a suite2p output folder.
+
+    Stitches each plane's registered-movie chunks (`reg_tif`/`reg_tif2`)
+    into one `(T, Z[, C], Y, X)` array; see `napari_tiff_suite2p` for
+    details.
+    """
+    directory = str(path[0] if isinstance(path, list) else path)
+    data, axes, reference_path = build_suite2p_layerdata(directory)
+    metadata_kwargs = get_suite2p_metadata(reference_path, axes)
+    return [(data, metadata_kwargs, "image")]
 
 
 def directory_reader_function(path: PathLike) -> List[LayerData]:
