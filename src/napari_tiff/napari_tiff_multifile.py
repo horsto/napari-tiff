@@ -1,10 +1,18 @@
 """Generic, non-ScanImage-specific helpers for combining multiple TIFF files.
 
-When a user drags/selects several TIFF files into napari at once, this
-module decides whether they can be stacked into one array, orders them
-naturally, and infers a defensible label (e.g. ``T``) for the new axis
-created by joining them - falling back to a neutral, non-committal label
-when there isn't enough evidence to call it a timeseries.
+When napari hands `multifile_reader_function` (in `napari_tiff_reader`) a
+list of several TIFF files, this module decides whether they can be stacked
+into one array, orders them naturally, and infers a defensible label (e.g.
+``T``) for the new axis created by joining them - falling back to a
+neutral, non-committal label when there isn't enough evidence to call it a
+timeseries.
+
+Note that napari only passes a list of paths to a reader when the files
+were explicitly opened "as a stack" (e.g. via napari's *File > Open Files
+as Stack...* menu, or `viewer.open(paths, stack=True)`); a plain
+drag-and-drop of multiple files calls the reader once per file instead.
+See the docstring of `napari_tiff.napari_tiff_reader.napari_get_reader`
+for the full explanation.
 """
 import logging
 import re

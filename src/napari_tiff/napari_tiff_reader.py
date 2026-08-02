@@ -37,10 +37,33 @@ ReaderFunction = Callable[[PathLike], List[LayerData]]
 def napari_get_reader(path: PathLike) -> Optional[ReaderFunction]:
     """Implements napari_get_reader hook specification.
 
+    Dispatches to `scanimage_reader_function` for ScanImage files (detected
+    via `TiffFile.is_scanimage` on the first path), to `multifile_reader_function`
+    when handed more than one non-ScanImage path, and to the generic
+    `reader_function` otherwise.
+
+    Note on when `path` is a list
+    ------------------------------
+    napari only calls this hook with a list of paths when the caller
+    explicitly requests "stack" behaviour - e.g. `viewer.open(paths,
+    stack=True)`, napari's *File > Open Files as Stack...* menu item
+    (`Cmd+Option+O` / `Ctrl+Alt+O`), or dragging files in while holding
+    Shift. Plain drag-and-drop of multiple files (no modifier held) calls
+    this hook once *per file* instead, since napari's default is
+    `stack=False`. Note that holding Shift during an external
+    (e.g. Finder-to-app) drag is not always reliably detected by Qt on
+    macOS, so "Open Files as Stack..." is the more dependable way to pass
+    an explicit multi-file selection through to `scanimage_reader_function`/
+    `multifile_reader_function` below. A single ScanImage file does not
+    need any of this: `scanimage_reader_function` auto-discovers a split
+    acquisition's sibling files from just one of them regardless of how it
+    was opened.
+
     Parameters
     ----------
     path : str or list of str
-        Path to file, or list of paths.
+        Path to file, or list of paths (only when napari is opening "as a
+        stack"; see note above).
 
     Returns
     -------
@@ -87,9 +110,14 @@ def scanimage_reader_function(path: PathLike) -> List[LayerData]:
 
     If `path` is a single file belonging to a split (multi-file)
     acquisition, automatically discovers and stitches in all of its
-    sibling files. If `path` is already a list, that exact set of files
-    (which may be any subset, in any order, of a split acquisition) is
-    stitched instead, naturally sorted by file index.
+    sibling files - this is what happens for an ordinary, single-file
+    drag-and-drop, and needs no special napari "stack" handling. If `path`
+    is already a list (napari only passes a list when opening "as a
+    stack" - see `napari_get_reader`), that exact set of files is stitched
+    instead - which may be any subset, in any order, of a split
+    acquisition - naturally sorted by file index. Falls back to the
+    generic `reader_function` (on just the first path) if anything above
+    fails.
     """
     try:
         if isinstance(path, list):
@@ -114,9 +142,12 @@ def scanimage_reader_function(path: PathLike) -> List[LayerData]:
 def multifile_reader_function(path: PathLike) -> List[LayerData]:
     """Return napari LayerData combining multiple (non-ScanImage) TIFF files.
 
-    Files are naturally sorted and checked for structural compatibility
-    before being combined; incompatible files are instead opened as
-    independent layers.
+    Only ever invoked by `napari_get_reader` when `path` is already a list
+    of more than one file - i.e. napari opened these files "as a stack"
+    (see the note in `napari_get_reader`). Files are naturally sorted and
+    checked for structural compatibility before being combined via
+    `build_multifile_layerdata`/`infer_join_axis`; incompatible files are
+    instead opened as independent layers via `reader_function`.
     """
     paths = natural_sort([str(p) for p in path]) if isinstance(path, list) else [str(path)]
 
