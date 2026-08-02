@@ -136,6 +136,12 @@ def test_multifile_reader_falls_back_to_independent_layers_when_incompatible(tmp
 def test_multifile_reader_concatenates_existing_leading_axis(tmp_path):
     """Files that are themselves already multi-frame (e.g. partial
     timeseries chunks) should extend that same axis, not add a new one.
+
+    Regression test: napari raises ``ValueError: axis_labels=(...) must
+    have length ndim=...`` if `scale`/`units`/`channel_axis` are shifted as
+    though a brand new axis were added, when in fact the per-file leading
+    axis was only relabeled/extended (e.g. a folder of suite2p-style
+    ``reg_tif`` chunks, each already a 3D (frames, Y, X) stack).
     """
     chunk_a = np.random.randint(0, 255, (3, 5, 5)).astype(np.uint8)
     chunk_b = np.random.randint(0, 255, (4, 5, 5)).astype(np.uint8)
@@ -144,9 +150,13 @@ def test_multifile_reader_concatenates_existing_leading_axis(tmp_path):
         _write_plain_tiff(tmp_path / "chunk_00002.tif", chunk_b, photometric="minisblack"),
     ]
     layer_data_list = multifile_reader_function(paths)
-    result, _kwargs, _layer_type = layer_data_list[0]
+    result, kwargs, _layer_type = layer_data_list[0]
     assert result.shape == (7, 5, 5)
     assert_array_equal(result.compute(), np.concatenate([chunk_a, chunk_b], axis=0))
+    assert result.ndim == 3
+    assert len(kwargs["axis_labels"]) == 3
+    assert len(kwargs["scale"]) == 3
+    assert len(kwargs["units"]) == 3
 
 
 def test_list_tiff_files_in_directory_is_naturally_sorted_and_non_recursive(tmp_path):

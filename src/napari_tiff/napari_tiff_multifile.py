@@ -226,25 +226,36 @@ def get_multifile_metadata(
     """Return napari layer metadata for a combined multi-file stack.
 
     Reuses the single-file metadata (colormaps, per-axis scale/units, etc.)
-    derived from `reference_path`, then prepends a neutral scale/unit entry
-    for the new joining axis and records the axis-label confidence in the
-    layer's `metadata` dict for user inspection.
+    derived from `reference_path`. `combined_axes` may either be one axis
+    *longer* than `reference_path`'s own series axes (when each file was a
+    plain 2D `YX` image and `build_multifile_layerdata` stacked them along a
+    brand new leading axis), or the *same* length (when each file was
+    already >=3D and its own existing leading axis was simply relabeled and
+    extended via concatenation, e.g. suite2p-style per-file frame chunks).
+    Only the first case needs a new scale/unit/channel_axis entry inserted;
+    the second case must reuse the per-file metadata's existing values
+    as-is, or `scale`/`units`/`axis_labels` end up with mismatched, too-long
+    tuples relative to the data's actual number of dimensions.
     """
     from napari_tiff.napari_tiff_metadata import get_metadata
 
     with TiffFile(reference_path) as tif:
         base_kwargs = get_metadata(tif)
+        reference_ndim = len(tif.series[0].axes)
 
-    channel_axis = base_kwargs.get("channel_axis")
-    if channel_axis is not None:
-        base_kwargs["channel_axis"] = channel_axis + 1
+    new_leading_axis = reference_ndim < len(combined_axes)
 
-    scale = base_kwargs.get("scale")
-    units = base_kwargs.get("units")
-    if isinstance(scale, tuple):
-        base_kwargs["scale"] = (1.0,) + scale
-    if isinstance(units, tuple):
-        base_kwargs["units"] = ("pixel",) + units
+    if new_leading_axis:
+        channel_axis = base_kwargs.get("channel_axis")
+        if channel_axis is not None:
+            base_kwargs["channel_axis"] = channel_axis + 1
+
+        scale = base_kwargs.get("scale")
+        units = base_kwargs.get("units")
+        if isinstance(scale, tuple):
+            base_kwargs["scale"] = (1.0,) + scale
+        if isinstance(units, tuple):
+            base_kwargs["units"] = ("pixel",) + units
 
     base_kwargs["axis_labels"] = tuple(c.lower() for c in combined_axes)
 
