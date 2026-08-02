@@ -1,11 +1,18 @@
+import os
+
 import numpy as np
 import tifffile
 from numpy.testing import assert_array_equal
 
-from napari_tiff.napari_tiff_reader import multifile_reader_function, napari_get_reader
+from napari_tiff.napari_tiff_reader import (
+    directory_reader_function,
+    multifile_reader_function,
+    napari_get_reader,
+)
 from napari_tiff.napari_tiff_multifile import (
     check_compatible,
     infer_join_axis,
+    list_tiff_files_in_directory,
     natural_sort,
 )
 
@@ -140,3 +147,49 @@ def test_multifile_reader_concatenates_existing_leading_axis(tmp_path):
     result, _kwargs, _layer_type = layer_data_list[0]
     assert result.shape == (7, 5, 5)
     assert_array_equal(result.compute(), np.concatenate([chunk_a, chunk_b], axis=0))
+
+
+def test_list_tiff_files_in_directory_is_naturally_sorted_and_non_recursive(tmp_path):
+    (tmp_path / "sub").mkdir()
+    _write_plain_tiff(tmp_path / "sub" / "nested.tif", np.zeros((2, 2), dtype=np.uint8))
+    _write_plain_tiff(tmp_path / "img10.tif", np.zeros((2, 2), dtype=np.uint8))
+    _write_plain_tiff(tmp_path / "img2.tif", np.zeros((2, 2), dtype=np.uint8))
+
+    (tmp_path / "notes.txt").write_text("not a tiff")
+
+    files = list_tiff_files_in_directory(str(tmp_path))
+    names = [os.path.basename(f) for f in files]
+    assert names == ["img2.tif", "img10.tif"]
+
+
+def test_reader_selected_for_directory_of_plain_tiffs(tmp_path):
+    data = np.random.randint(0, 255, (5, 5)).astype(np.uint8)
+    _write_plain_tiff(tmp_path / "a.tif", data)
+    _write_plain_tiff(tmp_path / "b.tif", data)
+    assert napari_get_reader(str(tmp_path)) is directory_reader_function
+
+
+def test_directory_reader_combines_plain_tiffs_in_folder(tmp_path):
+    data_a = np.random.randint(0, 255, (5, 5)).astype(np.uint8)
+    data_b = np.random.randint(0, 255, (5, 5)).astype(np.uint8)
+    _write_plain_tiff(tmp_path / "img_00001.tif", data_a)
+    _write_plain_tiff(tmp_path / "img_00002.tif", data_b)
+
+    layer_data_list = directory_reader_function(str(tmp_path))
+    result, _kwargs, layer_type = layer_data_list[0]
+    assert layer_type == "image"
+    assert result.shape == (2, 5, 5)
+    assert_array_equal(result.compute(), np.stack([data_a, data_b]))
+
+
+def test_directory_reader_single_file_in_folder(tmp_path):
+    data = np.random.randint(0, 255, (5, 5)).astype(np.uint8)
+    _write_plain_tiff(tmp_path / "only.tif", data)
+
+    layer_data_list = directory_reader_function(str(tmp_path))
+    result, _kwargs, _layer_type = layer_data_list[0]
+    assert_array_equal(result, data)
+
+
+def test_get_reader_returns_none_for_empty_directory(tmp_path):
+    assert napari_get_reader(str(tmp_path)) is None

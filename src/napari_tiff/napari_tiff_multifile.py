@@ -15,6 +15,7 @@ See the docstring of `napari_tiff.napari_tiff_reader.napari_get_reader`
 for the full explanation.
 """
 import logging
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,7 +24,7 @@ from typing import Any, Sequence
 import dask.array as da
 import zarr
 from natsort import natsorted
-from tifffile import TiffFile
+from tifffile import TIFF, TiffFile
 
 # Generic/undifferentiated axis codes used by tifffile itself for a plain
 # multi-page TIFF (no OME/ImageJ/etc. metadata to say what the pages mean).
@@ -36,6 +37,29 @@ def natural_sort(paths: Sequence[Any]) -> list[Any]:
     E.g. ``img2.tif`` sorts before ``img10.tif``.
     """
     return natsorted(paths, key=str)
+
+
+def list_tiff_files_in_directory(directory: str) -> list[str]:
+    """Return naturally-sorted TIFF files found directly inside `directory`.
+
+    Non-recursive: only files directly inside `directory` are considered,
+    not subdirectories. Used to resolve a directory path into a concrete
+    file list, since napari's manifest for this plugin declares
+    `accepts_directories: true` and may hand `napari_get_reader` a
+    directory path directly (e.g. when a folder is dragged in, or selected
+    via *File > Open Folder...*).
+    """
+    try:
+        entries = list(os.scandir(directory))
+    except OSError:
+        return []
+    files = [
+        entry.path
+        for entry in entries
+        if entry.is_file()
+        and any(entry.name.lower().endswith(ext) for ext in TIFF.FILE_EXTENSIONS)
+    ]
+    return natural_sort(files)
 
 
 @dataclass

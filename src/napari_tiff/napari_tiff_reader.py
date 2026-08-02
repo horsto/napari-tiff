@@ -9,6 +9,7 @@ see: https://napari.org/docs/plugins/hook_specifications.html
 Replace code below accordingly.  For complete documentation see:
 https://napari.org/docs/plugins/for_plugin_developers.html
 """
+import os
 import dask.array as da
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
@@ -19,6 +20,7 @@ from napari_tiff.napari_tiff_multifile import (
     build_multifile_layerdata,
     check_compatible,
     get_multifile_metadata,
+    list_tiff_files_in_directory,
     natural_sort,
 )
 from napari_tiff.napari_tiff_scanimage import (
@@ -59,11 +61,21 @@ def napari_get_reader(path: PathLike) -> Optional[ReaderFunction]:
     acquisition's sibling files from just one of them regardless of how it
     was opened.
 
+    Note on directories
+    --------------------
+    This plugin's manifest declares `accepts_directories: true`, so napari
+    may hand this hook a single directory path directly (e.g. a folder
+    dragged in, or chosen via *File > Open Folder...*). `path` is *not*
+    pre-expanded into its contents by napari in that case, so this
+    function (and `directory_reader_function`, which actually receives the
+    unexpanded directory path when napari later calls the returned reader)
+    must resolve it themselves via `list_tiff_files_in_directory`.
+
     Parameters
     ----------
     path : str or list of str
-        Path to file, or list of paths (only when napari is opening "as a
-        stack"; see note above).
+        Path to file or directory, or list of paths (only when napari is
+        opening "as a stack"; see note above).
 
     Returns
     -------
@@ -73,6 +85,10 @@ def napari_get_reader(path: PathLike) -> Optional[ReaderFunction]:
     """
     paths = path if isinstance(path, list) else [path]
     first_path = paths[0]
+
+    if len(paths) == 1 and os.path.isdir(first_path):
+        return directory_reader_function if list_tiff_files_in_directory(first_path) else None
+
     first_path_lower = first_path.lower()
     if first_path_lower.endswith("zip"):
         return zip_reader
@@ -90,6 +106,34 @@ def napari_get_reader(path: PathLike) -> Optional[ReaderFunction]:
     if len(paths) > 1:
         return multifile_reader_function
     return reader_function
+
+
+def directory_reader_function(path: PathLike) -> List[LayerData]:
+    """Return napari LayerData for a directory dropped/selected directly.
+
+    Resolves the directory to its naturally-sorted TIFF files (non-recursive)
+    via `list_tiff_files_in_directory`, then dispatches exactly as
+    `napari_get_reader` would for that resolved file list: ScanImage-aware
+    stitching if the first file is a ScanImage acquisition, the generic
+    multi-file combiner for more than one other TIFF, or the plain
+    single-file reader if only one match is found.
+    """
+    directory = path[0] if isinstance(path, list) else path
+    files = list_tiff_files_in_directory(str(directory))
+    if not files:
+        raise ValueError(f"no TIFF files found in directory {directory!r}")
+
+    try:
+        with TiffFile(files[0]) as tif:
+            is_scanimage = tif.is_scanimage
+    except Exception:
+        is_scanimage = False
+
+    if is_scanimage:
+        return scanimage_reader_function(files)
+    if len(files) > 1:
+        return multifile_reader_function(files)
+    return reader_function(files[0])
 
 
 def reader_function(path: PathLike) -> List[LayerData]:

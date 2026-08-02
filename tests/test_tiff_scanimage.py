@@ -1,3 +1,4 @@
+from pathlib import Path
 from unittest import mock
 
 import numpy as np
@@ -12,7 +13,11 @@ from base_data import (
     scanimage_volumetric_tiff,
     write_scanimage_tiff,
 )
-from napari_tiff.napari_tiff_reader import napari_get_reader, scanimage_reader_function
+from napari_tiff.napari_tiff_reader import (
+    directory_reader_function,
+    napari_get_reader,
+    scanimage_reader_function,
+)
 from napari_tiff.napari_tiff_scanimage import (
     ScanImageDims,
     build_scanimage_layerdata,
@@ -181,6 +186,25 @@ def test_build_scanimage_layerdata_clips_to_actual_page_count(scanimage_timeseri
 
     assert combined.shape == data.shape
     assert_array_equal(combined.compute(), data)
+
+
+def test_reader_selected_for_directory_of_scanimage_files(scanimage_split_files):
+    paths, _datas = scanimage_split_files
+    directory = str(Path(paths[0]).parent)
+    assert napari_get_reader(directory) is directory_reader_function
+
+
+def test_directory_reader_stitches_scanimage_split_files(scanimage_split_files):
+    """Dropping the containing folder itself (not the files inside it)
+    must resolve to, and stitch, the same ScanImage acquisition.
+    """
+    paths, datas = scanimage_split_files
+    directory = str(Path(paths[0]).parent)
+    layer_data_list = directory_reader_function(directory)
+    result, _kwargs, _layer_type = layer_data_list[0]
+    assert result.shape == (6, 3, 4, 4)
+    expected = np.concatenate([d.reshape(2, 4, 4, 4)[:, :3] for d in datas], axis=0)
+    assert_array_equal(result.compute(), expected)
 
 
 def test_find_scanimage_series_files_single_naming_form_has_no_siblings(tmp_path):
