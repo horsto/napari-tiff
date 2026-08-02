@@ -299,8 +299,24 @@ def build_scanimage_layerdata(
     """Lazily build the combined, correctly-shaped array for a ScanImage acquisition."""
     volumes = []
     for path in paths:
+        with TiffFile(path) as tif:
+            n_pages = len(tif.pages)
         array, _axes, shape = lazy_series_array(path)
-        n_pages = shape[0]
+        if shape[0] != n_pages:
+            # tifffile's declared series shape (from SI.hStackManager metadata,
+            # e.g. framesPerSlice) can exceed the pages actually present on
+            # disk, for example when a file is part of a longer acquisition
+            # whose continuation files were not found/selected. Always trust
+            # the real, on-disk page count to avoid addressing pages that
+            # don't exist.
+            log_warning(
+                f"{path!r} declares {shape[0]} frames in its metadata, but "
+                f"only {n_pages} are actually present on disk (it may be "
+                "part of a longer acquisition whose continuation files were "
+                "not found); using the actual page count"
+            )
+            array = array[:n_pages]
+
         n_groups, remainder = divmod(n_pages, dims.frames_per_group)
         if remainder:
             log_warning(

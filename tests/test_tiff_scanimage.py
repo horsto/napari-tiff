@@ -1,3 +1,5 @@
+from unittest import mock
+
 import numpy as np
 import pytest
 from numpy.testing import assert_array_equal
@@ -12,6 +14,8 @@ from base_data import (
 )
 from napari_tiff.napari_tiff_reader import napari_get_reader, scanimage_reader_function
 from napari_tiff.napari_tiff_scanimage import (
+    ScanImageDims,
+    build_scanimage_layerdata,
     compute_scanimage_dimensions,
     find_scanimage_series_files,
     get_scanimage_framedata,
@@ -149,6 +153,34 @@ def test_reader_explicit_noncontiguous_subset_warns(scanimage_split_files):
         axis=0,
     )
     assert_array_equal(result.compute(), expected)
+
+
+def test_build_scanimage_layerdata_clips_to_actual_page_count(scanimage_timeseries_tiff):
+    """Regression test: ScanImage's own declared series shape (e.g. from
+    `SI.hStackManager.framesPerSlice`) can exceed the pages actually present
+    on disk when a file is part of a longer acquisition whose continuation
+    files are missing. `build_scanimage_layerdata` must trust the real page
+    count rather than the declared one, or napari raises an IndexError when
+    it tries to read/display a page that doesn't exist.
+    """
+    path, data = scanimage_timeseries_tiff  # 6 real pages on disk
+    dims = ScanImageDims(
+        axes="TYX", frames_per_group=1, frames_to_keep=1, n_slices=1, n_channels=1
+    )
+
+    with mock.patch(
+        "napari_tiff.napari_tiff_scanimage.lazy_series_array"
+    ) as mocked_lazy_array:
+        from napari_tiff.napari_tiff_multifile import lazy_series_array as real_lazy_array
+
+        array, axes, shape = real_lazy_array(path)
+        # simulate tifffile over-declaring the frame count (e.g. 100 instead
+        # of the real 6), as happens for truncated/split acquisitions
+        mocked_lazy_array.return_value = (array, axes, (100,) + shape[1:])
+        combined, combined_axes = build_scanimage_layerdata([path], dims)
+
+    assert combined.shape == data.shape
+    assert_array_equal(combined.compute(), data)
 
 
 def test_find_scanimage_series_files_single_naming_form_has_no_siblings(tmp_path):
