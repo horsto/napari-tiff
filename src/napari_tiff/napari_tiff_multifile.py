@@ -1,18 +1,11 @@
 """Generic, non-ScanImage-specific helpers for combining multiple TIFF files.
 
-When napari hands `multifile_reader_function` (in `napari_tiff_reader`) a
-list of several TIFF files, this module decides whether they can be stacked
-into one array, orders them naturally, and infers a defensible label (e.g.
-``T``) for the new axis created by joining them - falling back to a
-neutral, non-committal label when there isn't enough evidence to call it a
-timeseries.
-
-Note that napari only passes a list of paths to a reader when the files
-were explicitly opened "as a stack" (e.g. via napari's *File > Open Files
-as Stack...* menu, or `viewer.open(paths, stack=True)`); a plain
-drag-and-drop of multiple files calls the reader once per file instead.
-See the docstring of `napari_tiff.napari_tiff_reader.napari_get_reader`
-for the full explanation.
+Used by `multifile_reader_function` (`napari_tiff_reader`) to decide
+whether a list of files can be stacked, order them naturally, and infer a
+defensible label (e.g. ``T``) for the axis created by joining them -
+falling back to a neutral label when there's no evidence it's a
+timeseries. See `napari_get_reader` for when napari hands a reader a list
+of paths vs. a single path.
 """
 import logging
 import os
@@ -40,14 +33,9 @@ def natural_sort(paths: Sequence[Any]) -> list[Any]:
 
 
 def list_tiff_files_in_directory(directory: str) -> list[str]:
-    """Return naturally-sorted TIFF files found directly inside `directory`.
+    """Return naturally-sorted TIFF files directly inside `directory`.
 
-    Non-recursive: only files directly inside `directory` are considered,
-    not subdirectories. Used to resolve a directory path into a concrete
-    file list, since napari's manifest for this plugin declares
-    `accepts_directories: true` and may hand `napari_get_reader` a
-    directory path directly (e.g. when a folder is dragged in, or selected
-    via *File > Open Folder...*).
+    Non-recursive: subdirectories are not searched.
     """
     try:
         entries = list(os.scandir(directory))
@@ -225,17 +213,12 @@ def get_multifile_metadata(
 ) -> dict[str, Any]:
     """Return napari layer metadata for a combined multi-file stack.
 
-    Reuses the single-file metadata (colormaps, per-axis scale/units, etc.)
-    derived from `reference_path`. `combined_axes` may either be one axis
-    *longer* than `reference_path`'s own series axes (when each file was a
-    plain 2D `YX` image and `build_multifile_layerdata` stacked them along a
-    brand new leading axis), or the *same* length (when each file was
-    already >=3D and its own existing leading axis was simply relabeled and
-    extended via concatenation, e.g. suite2p-style per-file frame chunks).
-    Only the first case needs a new scale/unit/channel_axis entry inserted;
-    the second case must reuse the per-file metadata's existing values
-    as-is, or `scale`/`units`/`axis_labels` end up with mismatched, too-long
-    tuples relative to the data's actual number of dimensions.
+    Reuses `reference_path`'s own single-file metadata. A new scale/unit/
+    channel_axis entry is only inserted when `combined_axes` is longer than
+    that file's series axes (a genuinely new leading axis was added); if
+    the lengths match, an existing per-file axis was just relabeled and
+    extended (e.g. concatenating multi-frame chunks), so the per-file
+    values are reused as-is to avoid over-long `scale`/`units` tuples.
     """
     from napari_tiff.napari_tiff_metadata import get_metadata
 

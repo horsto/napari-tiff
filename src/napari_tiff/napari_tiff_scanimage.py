@@ -11,16 +11,9 @@ ScanImage timeseries can be:
 This module parses ScanImage's ``SI.*`` metadata (falling back to the
 per-page ``Software`` tag when the file has no BigTIFF metadata header),
 decides how to reshape the flat page stack accordingly, and locates/orders
-the sibling files of a split acquisition.
-
-Note: `find_scanimage_series_files` (auto-discovery from a single file) is
-what handles an ordinary, single-file drag-and-drop of one part of a split
-acquisition - no special napari "stack" interaction is needed for that
-case. Passing an explicit list of files (which napari only does when files
-are opened "as a stack", e.g. via *File > Open Files as Stack...*) instead
-honors exactly that subset/order; see `napari_tiff.napari_tiff_reader.
-scanimage_reader_function` and its module's `napari_get_reader` docstring
-for the full explanation of when napari passes a list vs. a single path.
+the sibling files of a split acquisition. See `napari_tiff.
+napari_tiff_reader.scanimage_reader_function` for how single-file
+auto-discovery vs. an explicit file list are handled.
 """
 import logging
 import re
@@ -251,11 +244,8 @@ def warn_on_frame_number_gaps(paths: Sequence[str]) -> None:
 def find_scanimage_series_files(path: str) -> list[str]:
     """Find and order sibling files belonging to the same ScanImage acquisition as `path`.
 
-    Called from `scanimage_reader_function` whenever it receives a single
-    path (the common case: an ordinary drag-and-drop of one file, with no
-    napari "stack" interaction required from the user). Returns just
-    `[path]` if `path` uses the single-file naming form, or if no confirmed
-    siblings are found.
+    Returns just `[path]` if it uses the single-file naming form, or if no
+    siblings pass the static-metadata check below.
     """
     path = Path(path)
     base, acquisition, _file_index = _parse_scanimage_filename(str(path))
