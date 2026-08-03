@@ -21,6 +21,7 @@ from napari_tiff.napari_tiff_reader import (
     napari_get_reader,
     scanimage_reader_function,
 )
+from napari_tiff.napari_tiff_metadata import get_scanimage_metadata
 from napari_tiff.napari_tiff_scanimage import (
     compute_scanimage_dimensions,
     find_scanimage_series_files,
@@ -371,6 +372,32 @@ def test_reader_single_volume_frames_per_slice_reshapes_correctly(
     # on disk: Z-outer, frame-repeat-inner; exposed array is transposed to F-major, Z-minor
     expected = data.reshape(1, 7, 20, 4, 4).transpose(0, 2, 1, 3, 4)
     assert_array_equal(result.compute(), expected)
+
+
+def test_z_spacing_correct_with_frames_per_slice_single_volume(
+    scanimage_frames_per_slice_single_volume_tiff,
+):
+    """Regression test: `SI.hStackManager.zs` repeats each Z-position's
+    value `framesPerSlice` times in a row (Z-outer, frame-repeat-inner),
+    so naively differencing consecutive entries wildly underestimates the
+    real step size (mostly-zero diffs between repeats dilute the real
+    steps). Must sample every `framesPerSlice`-th entry instead.
+    """
+    path, _data = scanimage_frames_per_slice_single_volume_tiff
+    with TiffFile(path) as tif:
+        kwargs = get_scanimage_metadata(tif)
+    z_index = kwargs["axis_labels"].index("z")
+    assert kwargs["scale"][z_index] == pytest.approx(5.0)
+
+
+def test_z_spacing_correct_with_frames_per_slice_multivolume(
+    scanimage_frames_per_slice_multivolume_tiff,
+):
+    path, _data = scanimage_frames_per_slice_multivolume_tiff
+    with TiffFile(path) as tif:
+        kwargs = get_scanimage_metadata(tif)
+    z_index = kwargs["axis_labels"].index("z")
+    assert kwargs["scale"][z_index] == pytest.approx(5.0)
 
 
 def test_reader_single_volume_frames_per_slice_layer_can_be_added_to_viewer(

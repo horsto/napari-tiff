@@ -347,9 +347,19 @@ def get_scanimage_metadata(tif: TiffFile) -> dict[str, Any]:
     frame_rate = framedata.get("SI.hRoiManager.scanFrameRate")
     zs = framedata.get("SI.hStackManager.zs")
     z_spacing = None
-    if isinstance(zs, (list, tuple)) and len(zs) > 1:
-        diffs = [abs(b - a) for a, b in zip(zs, zs[1:])]
-        z_spacing = sum(diffs) / len(diffs)
+    if isinstance(zs, (list, tuple)) and dims.frames_per_slice >= 1 and dims.z_count > 1:
+        # `zs` lists one entry per on-disk raw frame (Z-outer,
+        # frame-repeat-inner - see ScanImageDims), so each Z-position's
+        # value is repeated `frames_per_slice` times in a row; sample
+        # every `frames_per_slice`-th entry to recover the true
+        # per-Z-position values before differencing. Naively differencing
+        # consecutive raw entries would average in the many zero-diffs
+        # between repeats of the same Z-position, badly underestimating
+        # the real step size.
+        z_positions = zs[: dims.frames_per_slice * dims.z_count : dims.frames_per_slice]
+        if len(z_positions) > 1:
+            diffs = [abs(b - a) for a, b in zip(z_positions, z_positions[1:])]
+            z_spacing = sum(diffs) / len(diffs)
 
     channel_axis = dims.axes.find("C")
     channel_axis = None if channel_axis < 0 else channel_axis
