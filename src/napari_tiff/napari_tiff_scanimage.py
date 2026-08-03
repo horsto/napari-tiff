@@ -24,9 +24,10 @@ from typing import Any, Sequence
 
 import dask.array as da
 import tifffile
+import zarr
 from tifffile import TiffFile
 
-from napari_tiff.napari_tiff_multifile import lazy_series_array, natural_sort
+from napari_tiff.napari_tiff_multifile import natural_sort
 
 # FrameData keys that are expected to legitimately vary between files
 # belonging to the very same acquisition and must be excluded when checking
@@ -80,14 +81,18 @@ def get_scanimage_framedata(tif: TiffFile) -> dict[str, Any]:
 class ScanImageDims:
     """Describes how to reshape a flat ScanImage page stack.
 
-    `axes` is one of ``'TYX'`` (plain timeseries), ``'TZYX'`` (volumetric
-    timeseries), or ``'IYX'`` (flat fallback - could not confirm structure).
+    `axes` is one of ``'TYX'``, ``'TCYX'``, ``'TZYX'``, ``'TZCYX'``, or
+    ``'IYX'`` (flat fallback - could not confirm structure). On disk, one
+    timepoint occupies `pages_per_step` consecutive pages: `z_group_size`
+    Z-positions (channel-minor: each Z-position's `n_channels` pages are
+    adjacent), of which only the first `z_keep` are real data (any excess
+    is a trailing "flyback" position to drop).
     """
 
     axes: str
-    frames_per_group: int
-    frames_to_keep: int
-    n_slices: int
+    pages_per_step: int
+    z_group_size: int
+    z_keep: int
     n_channels: int
     warning: str | None = None
 
@@ -95,9 +100,9 @@ class ScanImageDims:
 def _flat_dims(reason: str | None = None) -> ScanImageDims:
     return ScanImageDims(
         axes="IYX",
-        frames_per_group=1,
-        frames_to_keep=1,
-        n_slices=1,
+        pages_per_step=1,
+        z_group_size=1,
+        z_keep=1,
         n_channels=1,
         warning=reason,
     )
@@ -106,90 +111,93 @@ def _flat_dims(reason: str | None = None) -> ScanImageDims:
 def compute_scanimage_dimensions(
     framedata: dict[str, Any], total_pages: int
 ) -> ScanImageDims:
-    """Decide how to reshape a ScanImage page stack into T[,Z],Y,X.
+    """Decide how to reshape a ScanImage page stack into T[,Z][,C],Y,X.
 
     Gates volumetric interpretation on `SI.hStackManager.enable`/
     `SI.hFastZ.enable` (never on the mere presence of slice-count fields,
     which can be stale leftovers from a previous, inactive configuration).
-    Cross-validates the chosen on-disk group size against `total_pages`
-    before committing to a reshape; falls back to a flat interpretation
-    (with a warning) on any inconsistency.
+    On disk, channels are always the fastest-varying axis (confirmed
+    against real single- and multi-channel, flat and volumetric ScanImage
+    files: consecutive pages share the same `frameNumbers`/Z-position and
+    only differ by channel). Cross-validates the chosen page grouping
+    against `total_pages` before committing to a reshape; falls back to a
+    flat interpretation (with a warning) on any inconsistency, and for
+    `SI.hStackManager.framesPerSlice > 1` volumetric acquisitions (whether
+    that extra per-slice dimension nests inside or outside Z has not been
+    verified against a real file).
     """
     if total_pages <= 0:
         return _flat_dims("no pages to interpret")
 
     channel_save = framedata.get("SI.hChannels.channelSave")
-    if isinstance(channel_save, (list, tuple)):
-        n_channels = len(channel_save)
-    else:
-        n_channels = 1
-
-    if n_channels > 1:
-        # Multi-channel on-disk frame ordering (interleaved per Z-plane vs.
-        # grouped by channel) has not been validated against a real
-        # multi-channel ScanImage file. Degrade safely rather than guess.
-        return ScanImageDims(
-            axes="IYX",
-            frames_per_group=1,
-            frames_to_keep=1,
-            n_slices=1,
-            n_channels=n_channels,
-            warning=(
-                "multi-channel ScanImage files are not yet supported for "
-                "volumetric/channel-aware reshaping; falling back to a flat "
-                "interpretation"
-            ),
-        )
+    n_channels = len(channel_save) if isinstance(channel_save, (list, tuple)) else 1
 
     volumetric = bool(framedata.get("SI.hStackManager.enable")) or bool(
         framedata.get("SI.hFastZ.enable")
     )
 
     if not volumetric:
-        return ScanImageDims(
-            axes="TYX",
-            frames_per_group=1,
-            frames_to_keep=1,
-            n_slices=1,
-            n_channels=n_channels,
+        z_group_size = 1
+        z_keep = 1
+    else:
+        frames_per_slice = framedata.get("SI.hStackManager.framesPerSlice")
+        try:
+            unsupported_repeat = int(frames_per_slice) != 1
+        except (TypeError, ValueError):
+            unsupported_repeat = False
+        if unsupported_repeat:
+            return _flat_dims(
+                f"volumetric acquisitions with more than one frame per "
+                f"Z-position (SI.hStackManager.framesPerSlice="
+                f"{frames_per_slice}) are not yet supported for reshaping; "
+                "falling back to a flat interpretation"
+            )
+
+        n_slices = framedata.get("SI.hStackManager.actualNumSlices")
+        frames_per_volume = framedata.get("SI.hStackManager.numFramesPerVolume")
+        frames_per_volume_flyback = framedata.get(
+            "SI.hStackManager.numFramesPerVolumeWithFlyback"
         )
+        if not n_slices or not frames_per_volume:
+            return _flat_dims(
+                "hStackManager/hFastZ reports volumetric acquisition, but "
+                "slice count fields are missing; falling back to a flat "
+                "interpretation"
+            )
+        try:
+            frames_per_volume = int(frames_per_volume)
+            z_group_size = int(frames_per_volume_flyback or frames_per_volume)
+        except (TypeError, ValueError):
+            return _flat_dims(
+                "could not parse hStackManager slice-count fields as integers"
+            )
+        if not (0 < frames_per_volume <= z_group_size):
+            return _flat_dims("inconsistent frames-per-volume metadata")
+        z_keep = frames_per_volume
 
-    n_slices = framedata.get("SI.hStackManager.actualNumSlices")
-    frames_per_volume = framedata.get("SI.hStackManager.numFramesPerVolume")
-    frames_per_volume_flyback = framedata.get(
-        "SI.hStackManager.numFramesPerVolumeWithFlyback"
-    )
-
-    if not n_slices or not frames_per_volume:
-        return _flat_dims(
-            "hStackManager/hFastZ reports volumetric acquisition, but slice "
-            "count fields are missing; falling back to a flat interpretation"
-        )
-
-    try:
-        n_slices = int(n_slices)
-        frames_per_volume = int(frames_per_volume)
-        on_disk_group = int(frames_per_volume_flyback or frames_per_volume)
-    except (TypeError, ValueError):
-        return _flat_dims(
-            "could not parse hStackManager slice-count fields as integers"
-        )
-
-    if on_disk_group <= 0 or total_pages % on_disk_group:
+    pages_per_step = z_group_size * n_channels
+    if pages_per_step <= 0 or total_pages % pages_per_step:
         return _flat_dims(
             f"total page count ({total_pages}) is not evenly divisible by "
-            f"the expected on-disk frames-per-volume ({on_disk_group}); "
+            f"the expected pages per timepoint ({pages_per_step} = "
+            f"{z_group_size} Z-position(s) x {n_channels} channel(s)); "
             "falling back to a flat interpretation"
         )
 
-    if not (0 < frames_per_volume <= on_disk_group):
-        return _flat_dims("inconsistent frames-per-volume metadata")
+    if z_keep <= 1 and n_channels <= 1:
+        axes = "TYX"
+    elif z_keep <= 1:
+        axes = "TCYX"
+    elif n_channels <= 1:
+        axes = "TZYX"
+    else:
+        axes = "TZCYX"
 
     return ScanImageDims(
-        axes="TZYX",
-        frames_per_group=on_disk_group,
-        frames_to_keep=frames_per_volume,
-        n_slices=n_slices,
+        axes=axes,
+        pages_per_step=pages_per_step,
+        z_group_size=z_group_size,
+        z_keep=z_keep,
         n_channels=n_channels,
     )
 
@@ -295,44 +303,52 @@ def find_scanimage_series_files(path: str) -> list[str]:
     return confirmed
 
 
+def _lazy_flat_page_array(path: str) -> tuple[da.Array, tuple[int, ...]]:
+    """Return a lazy, page-indexed ``(n_pages, Y, X)`` dask array for `path`.
+
+    Built directly from each page's own store rather than `tif.series[0]`:
+    tifffile's built-in ScanImage series-shape inference derives its "Z"
+    axis purely from `SI.hStackManager.framesPerSlice` and the total page
+    count, which disagrees with the true on-disk layout once channels are
+    involved (`compute_scanimage_dimensions` implements the correct
+    interpretation instead, so this always starts from the raw pages).
+    """
+    with TiffFile(path) as tif:
+        page_shape = tif.pages[0].shape
+        stores = [page.aszarr() for page in tif.pages]
+    arrays = [da.from_zarr(zarr.open(store, mode="r")) for store in stores]
+    combined = da.stack(arrays, axis=0)
+    return combined, (len(arrays),) + page_shape
+
+
 def build_scanimage_layerdata(
     paths: Sequence[str], dims: ScanImageDims
 ) -> tuple[da.Array, str]:
     """Lazily build the combined, correctly-shaped array for a ScanImage acquisition."""
     volumes = []
     for path in paths:
-        with TiffFile(path) as tif:
-            n_pages = len(tif.pages)
-        array, _axes, shape = lazy_series_array(path)
-        if shape[0] != n_pages:
-            # tifffile's declared series shape (from SI.hStackManager metadata,
-            # e.g. framesPerSlice) can exceed the pages actually present on
-            # disk, for example when a file is part of a longer acquisition
-            # whose continuation files were not found/selected. Always trust
-            # the real, on-disk page count to avoid addressing pages that
-            # don't exist.
-            log_warning(
-                f"{path!r} declares {shape[0]} frames in its metadata, but "
-                f"only {n_pages} are actually present on disk (it may be "
-                "part of a longer acquisition whose continuation files were "
-                "not found); using the actual page count"
-            )
-            array = array[:n_pages]
+        array, shape = _lazy_flat_page_array(path)
+        n_pages = shape[0]
 
-        n_groups, remainder = divmod(n_pages, dims.frames_per_group)
+        n_steps, remainder = divmod(n_pages, dims.pages_per_step)
         if remainder:
             log_warning(
                 f"{path!r} has {n_pages} pages, not a multiple of the expected "
-                f"{dims.frames_per_group} frames per volume; the trailing "
-                "incomplete group will be dropped"
+                f"{dims.pages_per_step} pages per timepoint; the trailing "
+                "incomplete timepoint will be dropped"
             )
-            array = array[: n_groups * dims.frames_per_group]
+            array = array[: n_steps * dims.pages_per_step]
 
-        y, x = array.shape[-2:]
-        grouped = array.reshape((n_groups, dims.frames_per_group, y, x))
-        kept = grouped[:, : dims.frames_to_keep]
-        if dims.n_slices <= 1:
-            kept = kept.reshape((n_groups, y, x))
+        y, x = shape[-2:]
+        grouped = array.reshape((n_steps, dims.z_group_size, dims.n_channels, y, x))
+        kept = grouped[:, : dims.z_keep]  # drop trailing flyback Z-position(s)
+
+        if dims.z_keep <= 1 and dims.n_channels <= 1:
+            kept = kept.reshape((n_steps, y, x))
+        elif dims.z_keep <= 1:
+            kept = kept.reshape((n_steps, dims.n_channels, y, x))
+        elif dims.n_channels <= 1:
+            kept = kept.reshape((n_steps, dims.z_keep, y, x))
         volumes.append(kept)
 
     combined = da.concatenate(volumes, axis=0)

@@ -9,6 +9,11 @@ import tifffile
 SCANIMAGE_DATA_DIR = Path(__file__).parent / "data" / "scanimage"
 SCANIMAGE_SOFTWARE_SINGLE = (SCANIMAGE_DATA_DIR / "software_single.txt").read_text()
 SCANIMAGE_SOFTWARE_SPLIT = (SCANIMAGE_DATA_DIR / "software_split.txt").read_text()
+SCANIMAGE_SOFTWARE_2CH = (SCANIMAGE_DATA_DIR / "software_2ch.txt").read_text()
+SCANIMAGE_SOFTWARE_VOL_2CH = (SCANIMAGE_DATA_DIR / "software_vol_2ch.txt").read_text()
+SCANIMAGE_SOFTWARE_FRAMES_PER_SLICE = (
+    SCANIMAGE_DATA_DIR / "software_frames_per_slice.txt"
+).read_text()
 
 
 def example_data_filepath(tmp_path, original_data):
@@ -146,6 +151,80 @@ def scanimage_volumetric_tiff(tmp_path):
     """
     path = tmp_path / "scanimage_vol_00001.tif"
     path, data = write_scanimage_tiff(path, SCANIMAGE_SOFTWARE_SPLIT, n_pages=8)
+    return str(path), data
+
+
+def write_scanimage_tiff_multi(
+    path,
+    software: str,
+    n_steps: int,
+    z_group_size: int = 1,
+    n_channels: int = 1,
+    shape=(4, 4),
+    dtype=np.int16,
+):
+    """Write a synthetic ScanImage-like BigTIFF with T steps x Z-positions x
+    channels, channel-minor within each Z-position (matching the confirmed
+    real on-disk order). Each page's pixel values encode
+    `1000*step + 10*z + channel` so tests can verify correct de-interleaving
+    and flyback-dropping independent of random data.
+    """
+    pages = []  # list of (pixel_value, frame_number)
+    frame_number = 1
+    for step in range(n_steps):
+        for z in range(z_group_size):
+            for channel in range(n_channels):
+                pages.append((1000 * step + 10 * z + channel, frame_number))
+            frame_number += 1
+
+    data = np.array(
+        [np.full(shape, value, dtype=dtype) for value, _fn in pages]
+    )
+    with tifffile.TiffWriter(path, bigtiff=True) as tif:
+        for i, (_value, fn) in enumerate(pages):
+            tif.write(
+                data[i],
+                software=software,
+                description=_scanimage_frame_description(fn),
+                contiguous=False,
+                metadata=None,
+            )
+    return path, data
+
+
+@pytest.fixture
+def scanimage_flat_two_channel_tiff(tmp_path):
+    """Plain (non-volumetric) 2-channel ScanImage timeseries: 5 timepoints."""
+    path = tmp_path / "scanimage_flat_2ch_00001.tif"
+    path, data = write_scanimage_tiff_multi(
+        path, SCANIMAGE_SOFTWARE_2CH, n_steps=5, z_group_size=1, n_channels=2
+    )
+    return str(path), data
+
+
+@pytest.fixture
+def scanimage_volumetric_two_channel_tiff(tmp_path):
+    """Volumetric 2-channel ScanImage timeseries: 2 volumes, real metadata
+    (`actualNumSlices=7`, on-disk Z-group-with-flyback=8, channelSave=[1,2]).
+    """
+    path = tmp_path / "scanimage_vol_2ch_00001.tif"
+    path, data = write_scanimage_tiff_multi(
+        path, SCANIMAGE_SOFTWARE_VOL_2CH, n_steps=2, z_group_size=8, n_channels=2
+    )
+    return str(path), data
+
+
+@pytest.fixture
+def scanimage_frames_per_slice_tiff(tmp_path):
+    """Volumetric acquisition with `SI.hStackManager.framesPerSlice=20`.
+
+    Not yet supported for reshaping (unverified Z/frame-repeat nesting
+    order); used to test the flat-fallback gate.
+    """
+    path = tmp_path / "scanimage_frames_per_slice_00001.tif"
+    path, data = write_scanimage_tiff(
+        path, SCANIMAGE_SOFTWARE_FRAMES_PER_SLICE, n_pages=5
+    )
     return str(path), data
 
 

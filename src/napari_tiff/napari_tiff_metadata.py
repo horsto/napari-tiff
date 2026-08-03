@@ -318,12 +318,13 @@ def get_scanimage_metadata(tif: TiffFile) -> dict[str, Any]:
 
     Derives axis labels and per-axis scale/units from ScanImage's `SI.*`
     settings: X/Y from the standard TIFF resolution tags, time from
-    `SI.hRoiManager.scanFrameRate` (scaled up by the on-disk frames-per-group
-    for volumetric acquisitions, since `T` then represents one volume, not
+    `SI.hRoiManager.scanFrameRate` (scaled up by the number of on-disk
+    Z-positions per timepoint, since `T` then represents one volume, not
     one frame), and Z spacing from consecutive differences in
-    `SI.hStackManager.zs`. Falls back to a flat, unlabeled interpretation
-    (with a logged warning) when the volumetric structure cannot be
-    confirmed - see `napari_tiff.napari_tiff_scanimage`.
+    `SI.hStackManager.zs`. Sets `channel_axis` (with generic per-channel
+    names/colormaps) when multiple channels are present. Falls back to a
+    flat, unlabeled interpretation (with a logged warning) when the
+    structure cannot be confirmed - see `napari_tiff.napari_tiff_scanimage`.
     """
     from napari_tiff.napari_tiff_scanimage import (
         compute_scanimage_dimensions,
@@ -348,16 +349,26 @@ def get_scanimage_metadata(tif: TiffFile) -> dict[str, Any]:
         diffs = [abs(b - a) for a, b in zip(zs, zs[1:])]
         z_spacing = sum(diffs) / len(diffs)
 
+    channel_axis = dims.axes.find("C")
+    channel_axis = None if channel_axis < 0 else channel_axis
+
+    # napari expects scale/units/axis_labels to describe only the
+    # non-channel dimensions when channel_axis is set (matching the
+    # convention used elsewhere in this file, e.g. get_tiff_metadata,
+    # get_ome_tiff_metadata); including a channel entry here would make
+    # these tuples one element too long once napari splits by channel.
     scale = []
     units = []
     axis_labels = []
     for axis in dims.axes:
+        if axis == "C":
+            continue
         axis_labels.append("i" if axis == "I" else axis.lower())
         if axis in "YX":
             scale.append(xy_scale[axis])
             units.append(xy_units[axis])
         elif axis == "T" and frame_rate:
-            scale.append(dims.frames_per_group / float(frame_rate))
+            scale.append(dims.z_group_size / float(frame_rate))
             units.append("s")
         elif axis == "Z" and z_spacing is not None:
             scale.append(z_spacing)
@@ -366,11 +377,18 @@ def get_scanimage_metadata(tif: TiffFile) -> dict[str, Any]:
             scale.append(1.0)
             units.append("pixel")
 
-    return dict(
+    kwargs = dict(
         axis_labels=tuple(axis_labels),
         scale=tuple(scale),
         units=tuple(units),
     )
+    if channel_axis is not None:
+        n_channels = dims.n_channels
+        kwargs["channel_axis"] = channel_axis
+        kwargs["name"] = [f"Channel {i}" for i in range(n_channels)]
+        kwargs["colormap"] = ["green", "magenta", "cyan", "yellow"][:n_channels]
+        kwargs["blending"] = ["additive"] * n_channels
+    return kwargs
 
 
 def get_scale_and_units_from_ome(pixels: dict[str, Any], axes: str, shape: tuple[int, ...]) -> tuple[list[float], list[str]]:
