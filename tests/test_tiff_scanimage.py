@@ -8,8 +8,8 @@ from tifffile import TiffFile
 from base_data import (
     SCANIMAGE_SOFTWARE_SINGLE,
     scanimage_flat_two_channel_tiff,
+    scanimage_frames_per_slice_multivolume_tiff,
     scanimage_frames_per_slice_single_volume_tiff,
-    scanimage_frames_per_slice_tiff,
     scanimage_split_files,
     scanimage_timeseries_tiff,
     scanimage_volumetric_tiff,
@@ -34,8 +34,8 @@ def test_compute_scanimage_dimensions_flat_timeseries():
     dims = compute_scanimage_dimensions(framedata, total_pages=6)
     assert dims.axes == "TYX"
     assert dims.pages_per_step == 1
-    assert dims.z_group_size == 1
-    assert dims.z_keep == 1
+    assert dims.on_disk_raw_frames == 1
+    assert dims.kept_raw_frames == 1
     assert dims.warning is None
 
 
@@ -65,8 +65,9 @@ def test_compute_scanimage_dimensions_volumetric_with_flyback():
     dims = compute_scanimage_dimensions(framedata, total_pages=8)
     assert dims.axes == "TZYX"
     assert dims.pages_per_step == 4
-    assert dims.z_group_size == 4
-    assert dims.z_keep == 3
+    assert dims.on_disk_raw_frames == 4
+    assert dims.kept_raw_frames == 3
+    assert dims.z_count == 3
     assert dims.warning is None
 
 
@@ -106,23 +107,24 @@ def test_compute_scanimage_dimensions_volumetric_multichannel():
     dims = compute_scanimage_dimensions(framedata, total_pages=16)  # 2 volumes
     assert dims.axes == "TZCYX"
     assert dims.pages_per_step == 8
-    assert dims.z_group_size == 4
-    assert dims.z_keep == 3
+    assert dims.on_disk_raw_frames == 4
+    assert dims.kept_raw_frames == 3
+    assert dims.z_count == 3
     assert dims.n_channels == 2
     assert dims.warning is None
 
 
-def test_compute_scanimage_dimensions_multivolume_frames_per_slice_falls_back():
-    """framesPerSlice > 1 combined with a trailing flyback frame (i.e. more
-    than one volume) is not yet supported and must degrade safely: the
-    single extra on-disk frame does not evenly divide by framesPerSlice.
+def test_compute_scanimage_dimensions_inconsistent_frames_per_slice_falls_back():
+    """actualNumSlices x framesPerSlice must equal numFramesPerVolume (a
+    real ScanImage invariant); if it doesn't, the metadata is inconsistent
+    and reshaping must degrade safely rather than guess.
     """
     framedata = {
         "SI.hStackManager.enable": True,
         "SI.hStackManager.actualNumSlices": 3,
         "SI.hStackManager.numFramesPerVolume": 3,
         "SI.hStackManager.numFramesPerVolumeWithFlyback": 4,
-        "SI.hStackManager.framesPerSlice": 20,
+        "SI.hStackManager.framesPerSlice": 20,  # 3 x 20 != 3
     }
     dims = compute_scanimage_dimensions(framedata, total_pages=8)
     assert dims.axes == "IYX"
@@ -130,8 +132,8 @@ def test_compute_scanimage_dimensions_multivolume_frames_per_slice_falls_back():
 
 
 def test_compute_scanimage_dimensions_single_volume_frames_per_slice():
-    """framesPerSlice > 1 *is* supported for a single volume (no flyback
-    ambiguity): repeated frames nest inside Z, producing a `'F'` axis.
+    """framesPerSlice > 1 for a single volume (no flyback): repeated
+    frames nest inside Z, producing a `'F'` axis.
     """
     framedata = {
         "SI.hStackManager.enable": True,
@@ -141,11 +143,34 @@ def test_compute_scanimage_dimensions_single_volume_frames_per_slice():
         "SI.hStackManager.framesPerSlice": 20,
     }
     dims = compute_scanimage_dimensions(framedata, total_pages=140)
-    assert dims.axes == "TZFYX"
-    assert dims.z_group_size == 7
-    assert dims.z_keep == 7
+    assert dims.axes == "TFZYX"
+    assert dims.on_disk_raw_frames == 140
+    assert dims.kept_raw_frames == 140
+    assert dims.z_count == 7
     assert dims.frames_per_slice == 20
     assert dims.pages_per_step == 140
+    assert dims.warning is None
+
+
+def test_compute_scanimage_dimensions_multivolume_frames_per_slice():
+    """framesPerSlice > 1 combined with a flyback (multiple volumes) is
+    now supported: the flyback is always a single trailing raw frame
+    appended once per volume, regardless of framesPerSlice.
+    """
+    framedata = {
+        "SI.hStackManager.enable": True,
+        "SI.hStackManager.actualNumSlices": 7,
+        "SI.hStackManager.numFramesPerVolume": 140,
+        "SI.hStackManager.numFramesPerVolumeWithFlyback": 141,
+        "SI.hStackManager.framesPerSlice": 20,
+    }
+    dims = compute_scanimage_dimensions(framedata, total_pages=1410)  # 10 volumes
+    assert dims.axes == "TFZYX"
+    assert dims.on_disk_raw_frames == 141
+    assert dims.kept_raw_frames == 140
+    assert dims.z_count == 7
+    assert dims.frames_per_slice == 20
+    assert dims.pages_per_step == 141
     assert dims.warning is None
 
 
@@ -296,17 +321,36 @@ def test_reader_volumetric_two_channel_layer_can_be_added_to_viewer(
     assert len(viewer.layers) == 2
 
 
-def test_reader_multivolume_frames_per_slice_falls_back_to_flat(
-    scanimage_frames_per_slice_tiff,
+def test_reader_multivolume_frames_per_slice_reshapes_correctly(
+    scanimage_frames_per_slice_multivolume_tiff,
 ):
-    """Multi-volume framesPerSlice > 1 is not yet supported; must still
-    open (flat), not error.
+    """Regression test for the third reported case: a multi-volume,
+    `framesPerSlice=20` acquisition must reshape into `(T, F, Z, Y, X)`
+    (F before Z, so Z stays adjacent to Y,X for correct napari 3D
+    rendering), correctly dropping the single trailing flyback frame per
+    volume (not a full extra Z-position's worth of repeated frames).
     """
-    path, data = scanimage_frames_per_slice_tiff
+    path, data = scanimage_frames_per_slice_multivolume_tiff  # 2 volumes, 282 pages
     layer_data_list = scanimage_reader_function(path)
     result, kwargs, _layer_type = layer_data_list[0]
-    assert result.shape == data.shape
-    assert kwargs["axis_labels"] == ("i", "y", "x")
+    assert result.shape == (2, 20, 7, 4, 4)
+    assert kwargs["axis_labels"] == ("t", "f", "z", "y", "x")
+    # on disk: Z-outer, frame-repeat-inner within the kept raw frames
+    expected = data.reshape(2, 141, 4, 4)[:, :140].reshape(2, 7, 20, 4, 4).transpose(0, 2, 1, 3, 4)
+    assert_array_equal(result.compute(), expected)
+
+
+def test_reader_multivolume_frames_per_slice_layer_can_be_added_to_viewer(
+    scanimage_frames_per_slice_multivolume_tiff,
+):
+    from napari.components import ViewerModel
+
+    path, _data = scanimage_frames_per_slice_multivolume_tiff
+    result, kwargs, _layer_type = scanimage_reader_function(path)[0]
+    viewer = ViewerModel()
+    viewer.add_image(result, **kwargs)
+    assert len(viewer.layers) == 1
+    assert viewer.layers[0].ndim == 5
 
 
 def test_reader_single_volume_frames_per_slice_reshapes_correctly(
@@ -314,14 +358,18 @@ def test_reader_single_volume_frames_per_slice_reshapes_correctly(
 ):
     """Regression test for the second reported case: a single-volume,
     `framesPerSlice=20` acquisition (7 Z-positions, 20 repeated frames
-    each, no flyback) must reshape into `(T, Z, F, Y, X)`, not fall back.
+    each, no flyback) must reshape into `(T, F, Z, Y, X)` (not `TZFYX`:
+    Z must stay adjacent to Y,X so napari's 3D mode renders true depth
+    instead of the frame-repeat axis - see the reported napari-3D-mode
+    bug), not fall back.
     """
     path, data = scanimage_frames_per_slice_single_volume_tiff  # 140 pages
     layer_data_list = scanimage_reader_function(path)
     result, kwargs, _layer_type = layer_data_list[0]
-    assert result.shape == (1, 7, 20, 4, 4)
-    assert kwargs["axis_labels"] == ("t", "z", "f", "y", "x")
-    expected = data.reshape(1, 7, 20, 4, 4)
+    assert result.shape == (1, 20, 7, 4, 4)
+    assert kwargs["axis_labels"] == ("t", "f", "z", "y", "x")
+    # on disk: Z-outer, frame-repeat-inner; exposed array is transposed to F-major, Z-minor
+    expected = data.reshape(1, 7, 20, 4, 4).transpose(0, 2, 1, 3, 4)
     assert_array_equal(result.compute(), expected)
 
 

@@ -81,20 +81,33 @@ def get_scanimage_framedata(tif: TiffFile) -> dict[str, Any]:
 class ScanImageDims:
     """Describes how to reshape a flat ScanImage page stack.
 
-    `axes` is `'T'` plus whichever of `'Z'`, `'F'`, `'C'` apply (in that
-    order), plus `'YX'` - e.g. ``'TYX'``, ``'TZCYX'``, ``'TZFYX'`` - or
-    ``'IYX'`` (flat fallback - could not confirm structure). On disk, one
-    timepoint occupies `pages_per_step` consecutive pages, nested outer to
-    inner as: `z_group_size` Z-positions (of which only the first `z_keep`
-    are real data, any excess being a trailing "flyback" position to
-    drop), `frames_per_slice` repeated frames captured at each Z-position
-    (`'F'`), and `n_channels` channels (fastest-varying).
+    `axes` is `'T'` plus whichever of `'F'`, `'Z'`, `'C'` apply (in that
+    order), plus `'YX'` - e.g. ``'TYX'``, ``'TZCYX'``, ``'TFZYX'`` - or
+    ``'IYX'`` (flat fallback - could not confirm structure). `'Z'` -
+    the only genuinely spatial non-displayed axis - is always kept
+    immediately adjacent to `'Y,X'`, and `'F'` (repeated frames, a second
+    time-like axis) is grouped next to `'T'` instead: napari's 3D
+    rendering mode treats the *last* 3 axes of the array as the displayed
+    volume, so this ordering ensures 3D mode renders true Z-depth rather
+    than the frame-repeat axis.
+
+    On disk, one timepoint (volume) occupies `pages_per_step` consecutive
+    pages: `on_disk_raw_frames` raw frame-scans (pre-channel), each
+    contributing `n_channels` adjacent pages (channels are always
+    fastest-varying). Only the *first* `kept_raw_frames` raw frames are
+    real data - any excess is a single trailing "flyback" raw frame
+    appended after the whole volume (not per Z-position) to drop. The
+    kept raw frames split evenly into `z_count` Z-positions of
+    `frames_per_slice` repeated frames each, on disk Z-outer/frame-repeat-
+    inner - `build_scanimage_layerdata` transposes this to frame-repeat-
+    major/Z-minor to match `axes`.
     """
 
     axes: str
     pages_per_step: int
-    z_group_size: int
-    z_keep: int
+    on_disk_raw_frames: int
+    kept_raw_frames: int
+    z_count: int
     frames_per_slice: int
     n_channels: int
     warning: str | None = None
@@ -104,8 +117,9 @@ def _flat_dims(reason: str | None = None) -> ScanImageDims:
     return ScanImageDims(
         axes="IYX",
         pages_per_step=1,
-        z_group_size=1,
-        z_keep=1,
+        on_disk_raw_frames=1,
+        kept_raw_frames=1,
+        z_count=1,
         frames_per_slice=1,
         n_channels=1,
         warning=reason,
@@ -122,15 +136,16 @@ def compute_scanimage_dimensions(
     which can be stale leftovers from a previous, inactive configuration).
     On disk, channels are always the fastest-varying axis, and
     `SI.hStackManager.framesPerSlice` repeated frames are captured at each
-    Z-position before moving to the next one (confirmed against real
-    single-volume acquisitions with 1-2 channels and `framesPerSlice` of
-    1 or 20). Cross-validates the chosen page grouping against
+    Z-position before moving to the next one. Any flyback overhead
+    (`numFramesPerVolumeWithFlyback - numFramesPerVolume`) is always a
+    single raw frame appended once at the very end of the whole volume's
+    real Z x frame-repeat data - never multiplied by `framesPerSlice` or
+    folded into an extra Z-position - confirmed against real single- and
+    multi-volume acquisitions with 1-2 channels and `framesPerSlice` of 1
+    or 20. Cross-validates `actualNumSlices x framesPerSlice ==
+    numFramesPerVolume` and the chosen page grouping against
     `total_pages` before committing to a reshape; falls back to a flat
-    interpretation (with a warning) on any inconsistency, and for
-    multi-volume acquisitions with `framesPerSlice > 1` specifically
-    (there, the trailing flyback frame does not evenly divide by
-    `framesPerSlice`, so its interaction with the repeated frames has not
-    been verified against a real file).
+    interpretation (with a warning) on any inconsistency.
     """
     if total_pages <= 0:
         return _flat_dims("no pages to interpret")
@@ -143,17 +158,11 @@ def compute_scanimage_dimensions(
     )
 
     if not volumetric:
-        z_group_size = 1
-        z_keep = 1
+        z_count = 1
         frames_per_slice = 1
+        kept_raw_frames = 1
+        on_disk_raw_frames = 1
     else:
-        try:
-            frames_per_slice = int(framedata.get("SI.hStackManager.framesPerSlice"))
-            if frames_per_slice < 1:
-                frames_per_slice = 1
-        except (TypeError, ValueError):
-            frames_per_slice = 1
-
         n_slices = framedata.get("SI.hStackManager.actualNumSlices")
         frames_per_volume = framedata.get("SI.hStackManager.numFramesPerVolume")
         frames_per_volume_flyback = framedata.get(
@@ -166,56 +175,59 @@ def compute_scanimage_dimensions(
                 "interpretation"
             )
         try:
+            n_slices = int(n_slices)
             frames_per_volume = int(frames_per_volume)
-            on_disk_frames = int(frames_per_volume_flyback or frames_per_volume)
+            on_disk_raw_frames = int(frames_per_volume_flyback or frames_per_volume)
         except (TypeError, ValueError):
             return _flat_dims(
                 "could not parse hStackManager slice-count fields as integers"
             )
-        if not (0 < frames_per_volume <= on_disk_frames):
+        if not (0 < frames_per_volume <= on_disk_raw_frames):
             return _flat_dims("inconsistent frames-per-volume metadata")
 
-        if frames_per_slice > 1 and frames_per_volume != on_disk_frames:
-            # A flyback frame is present *and* frames are repeated per
-            # Z-position: it's unverified whether the single extra on-disk
-            # frame (rather than a full extra frames_per_slice-sized group)
-            # implies the flyback interacts differently with the repeat
-            # loop here than in the always-1-extra-frame case below.
-            return _flat_dims(
-                "multi-volume acquisitions with more than one frame per "
-                f"Z-position (SI.hStackManager.framesPerSlice="
-                f"{frames_per_slice}) are not yet supported for reshaping; "
-                "falling back to a flat interpretation"
-            )
-        if on_disk_frames % frames_per_slice or frames_per_volume % frames_per_slice:
-            return _flat_dims(
-                f"frames-per-volume ({on_disk_frames}) is not evenly "
-                f"divisible by framesPerSlice ({frames_per_slice}); falling "
-                "back to a flat interpretation"
-            )
-        z_group_size = on_disk_frames // frames_per_slice
-        z_keep = frames_per_volume // frames_per_slice
+        try:
+            frames_per_slice = int(framedata.get("SI.hStackManager.framesPerSlice"))
+            if frames_per_slice < 1:
+                frames_per_slice = 1
+        except (TypeError, ValueError):
+            frames_per_slice = 1
 
-    pages_per_step = z_group_size * frames_per_slice * n_channels
+        if n_slices * frames_per_slice != frames_per_volume:
+            return _flat_dims(
+                f"actualNumSlices ({n_slices}) x framesPerSlice "
+                f"({frames_per_slice}) does not match numFramesPerVolume "
+                f"({frames_per_volume}); falling back to a flat interpretation"
+            )
+        z_count = n_slices
+        kept_raw_frames = frames_per_volume
+
+    pages_per_step = on_disk_raw_frames * n_channels
     if pages_per_step <= 0 or total_pages % pages_per_step:
         return _flat_dims(
             f"total page count ({total_pages}) is not evenly divisible by "
             f"the expected pages per timepoint ({pages_per_step} = "
-            f"{z_group_size} Z-position(s) x {frames_per_slice} frame(s)/Z "
-            f"x {n_channels} channel(s)); falling back to a flat interpretation"
+            f"{on_disk_raw_frames} raw frame(s) x {n_channels} channel(s)); "
+            "falling back to a flat interpretation"
         )
 
+    # 'F' (repeated frames, a second time-like axis) is grouped with 'T'
+    # rather than 'Z': napari's 3D rendering mode treats the *last* 3 axes
+    # of the array as the displayed volume, so 'Z' - the only genuinely
+    # spatial non-displayed axis - must stay immediately adjacent to 'Y,X'
+    # (channel_axis removes 'C' from each per-channel layer entirely, so
+    # its position relative to 'Z' doesn't matter here).
     axes = "T" + "".join(
         letter
-        for letter, size in (("Z", z_keep), ("F", frames_per_slice), ("C", n_channels))
+        for letter, size in (("F", frames_per_slice), ("Z", z_count), ("C", n_channels))
         if size > 1
     ) + "YX"
 
     return ScanImageDims(
         axes=axes,
         pages_per_step=pages_per_step,
-        z_group_size=z_group_size,
-        z_keep=z_keep,
+        on_disk_raw_frames=on_disk_raw_frames,
+        kept_raw_frames=kept_raw_frames,
+        z_count=z_count,
         frames_per_slice=frames_per_slice,
         n_channels=n_channels,
     )
@@ -359,17 +371,24 @@ def build_scanimage_layerdata(
             array = array[: n_steps * dims.pages_per_step]
 
         y, x = shape[-2:]
-        grouped = array.reshape(
-            (n_steps, dims.z_group_size, dims.frames_per_slice, dims.n_channels, y, x)
-        )
-        kept = grouped[:, : dims.z_keep]  # drop trailing flyback Z-position(s)
+        # first split into raw frame-scans x channels, and drop the
+        # trailing flyback raw frame(s) appended once at the end of the
+        # volume's real data (not per Z-position - see ScanImageDims)
+        by_raw_frame = array.reshape((n_steps, dims.on_disk_raw_frames, dims.n_channels, y, x))
+        kept = by_raw_frame[:, : dims.kept_raw_frames]
+        # the on-disk order within the kept raw frames is Z-outer,
+        # frame-repeat-inner; split that out first, then transpose so the
+        # *exposed* array is frame-repeat-major, Z-minor (matching `axes`
+        # above, with Z kept adjacent to Y,X)
+        kept = kept.reshape((n_steps, dims.z_count, dims.frames_per_slice, dims.n_channels, y, x))
+        kept = kept.transpose(0, 2, 1, 3, 4, 5)
 
-        # squeeze out whichever of Z/F/C are trivial (size 1), matching
+        # squeeze out whichever of F/Z/C are trivial (size 1), matching
         # `dims.axes`; squeezing never reorders data, so this is safe
         # regardless of which combination of axes is present.
         kept_shape = [n_steps]
         kept_shape += [
-            size for size in (dims.z_keep, dims.frames_per_slice, dims.n_channels) if size > 1
+            size for size in (dims.frames_per_slice, dims.z_count, dims.n_channels) if size > 1
         ]
         kept_shape += [y, x]
         kept = kept.reshape(tuple(kept_shape))

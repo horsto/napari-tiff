@@ -370,7 +370,9 @@ def get_scanimage_metadata(tif: TiffFile) -> dict[str, Any]:
             scale.append(xy_scale[axis])
             units.append(xy_units[axis])
         elif axis == "T" and frame_rate:
-            scale.append(dims.z_group_size * dims.frames_per_slice / float(frame_rate))
+            # on_disk_raw_frames (not kept_raw_frames) so the flyback's
+            # real physical time cost is reflected in the volume period
+            scale.append(dims.on_disk_raw_frames / float(frame_rate))
             units.append("s")
         elif axis == "Z" and z_spacing is not None:
             scale.append(z_spacing)
