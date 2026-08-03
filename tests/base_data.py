@@ -14,6 +14,9 @@ SCANIMAGE_SOFTWARE_VOL_2CH = (SCANIMAGE_DATA_DIR / "software_vol_2ch.txt").read_
 SCANIMAGE_SOFTWARE_FRAMES_PER_SLICE = (
     SCANIMAGE_DATA_DIR / "software_frames_per_slice.txt"
 ).read_text()
+SCANIMAGE_SOFTWARE_FRAMES_PER_SLICE_1VOL = (
+    SCANIMAGE_DATA_DIR / "software_frames_per_slice_1vol.txt"
+).read_text()
 
 
 def example_data_filepath(tmp_path, original_data):
@@ -216,14 +219,34 @@ def scanimage_volumetric_two_channel_tiff(tmp_path):
 
 @pytest.fixture
 def scanimage_frames_per_slice_tiff(tmp_path):
-    """Volumetric acquisition with `SI.hStackManager.framesPerSlice=20`.
+    """Multi-volume acquisition with `SI.hStackManager.framesPerSlice=20`.
 
-    Not yet supported for reshaping (unverified Z/frame-repeat nesting
-    order); used to test the flat-fallback gate.
+    Not yet supported for reshaping (the flyback frame does not evenly
+    divide by framesPerSlice, so its interaction with repeated frames is
+    unverified); used to test the flat-fallback gate.
     """
     path = tmp_path / "scanimage_frames_per_slice_00001.tif"
     path, data = write_scanimage_tiff(
         path, SCANIMAGE_SOFTWARE_FRAMES_PER_SLICE, n_pages=5
+    )
+    return str(path), data
+
+
+@pytest.fixture
+def scanimage_frames_per_slice_single_volume_tiff(tmp_path):
+    """Single-volume acquisition with `SI.hStackManager.framesPerSlice=20`.
+
+    Real metadata: `actualNumSlices=7`, no flyback (single volume), so
+    `numFramesPerVolume == numFramesPerVolumeWithFlyback == 140` (7
+    Z-positions x 20 repeated frames each) - this is fully supported.
+    """
+    path = tmp_path / "scanimage_frames_per_slice_1vol_00001.tif"
+    path, data = write_scanimage_tiff_multi(
+        path,
+        SCANIMAGE_SOFTWARE_FRAMES_PER_SLICE_1VOL,
+        n_steps=1,
+        z_group_size=140,
+        n_channels=1,
     )
     return str(path), data
 
