@@ -218,16 +218,17 @@ def scanimage_volumetric_two_channel_tiff(tmp_path):
 
 
 @pytest.fixture
-def scanimage_frames_per_slice_tiff(tmp_path):
+def scanimage_frames_per_slice_multivolume_tiff(tmp_path):
     """Multi-volume acquisition with `SI.hStackManager.framesPerSlice=20`.
 
-    Not yet supported for reshaping (the flyback frame does not evenly
-    divide by framesPerSlice, so its interaction with repeated frames is
-    unverified); used to test the flat-fallback gate.
+    Real metadata (`actualNumSlices=7`, `numFramesPerVolume=140`,
+    `numFramesPerVolumeWithFlyback=141`): 2 volumes are written as 282
+    on-disk pages (141 per volume: 140 real Z x frame-repeat data plus a
+    single trailing flyback frame to drop).
     """
-    path = tmp_path / "scanimage_frames_per_slice_00001.tif"
-    path, data = write_scanimage_tiff(
-        path, SCANIMAGE_SOFTWARE_FRAMES_PER_SLICE, n_pages=5
+    path = tmp_path / "scanimage_frames_per_slice_mv_00001.tif"
+    path, data = write_scanimage_tiff_multi(
+        path, SCANIMAGE_SOFTWARE_FRAMES_PER_SLICE, n_steps=2, z_group_size=141, n_channels=1
     )
     return str(path), data
 
