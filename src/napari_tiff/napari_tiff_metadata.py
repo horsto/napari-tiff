@@ -318,13 +318,15 @@ def get_scanimage_metadata(tif: TiffFile) -> dict[str, Any]:
 
     Derives axis labels and per-axis scale/units from ScanImage's `SI.*`
     settings: X/Y from the standard TIFF resolution tags, time from
-    `SI.hRoiManager.scanFrameRate` (scaled up by the number of on-disk
-    Z-positions per timepoint, since `T` then represents one volume, not
-    one frame), and Z spacing from consecutive differences in
-    `SI.hStackManager.zs`. Sets `channel_axis` (with generic per-channel
-    names/colormaps) when multiple channels are present. Falls back to a
-    flat, unlabeled interpretation (with a logged warning) when the
-    structure cannot be confirmed - see `napari_tiff.napari_tiff_scanimage`.
+    `SI.hRoiManager.scanFrameRate` (`T` scaled up by the number of
+    physical frames per timepoint - Z-positions times repeated frames per
+    Z-position - since `T` represents one volume, not one frame; `F`, the
+    repeated-frame axis, gets the frame period directly), and Z spacing
+    from consecutive differences in `SI.hStackManager.zs`. Sets
+    `channel_axis` (with generic per-channel names/colormaps) when
+    multiple channels are present. Falls back to a flat, unlabeled
+    interpretation (with a logged warning) when the structure cannot be
+    confirmed - see `napari_tiff.napari_tiff_scanimage`.
     """
     from napari_tiff.napari_tiff_scanimage import (
         compute_scanimage_dimensions,
@@ -368,11 +370,14 @@ def get_scanimage_metadata(tif: TiffFile) -> dict[str, Any]:
             scale.append(xy_scale[axis])
             units.append(xy_units[axis])
         elif axis == "T" and frame_rate:
-            scale.append(dims.z_group_size / float(frame_rate))
+            scale.append(dims.z_group_size * dims.frames_per_slice / float(frame_rate))
             units.append("s")
         elif axis == "Z" and z_spacing is not None:
             scale.append(z_spacing)
             units.append("\u00b5m")
+        elif axis == "F" and frame_rate:
+            scale.append(1.0 / float(frame_rate))
+            units.append("s")
         else:
             scale.append(1.0)
             units.append("pixel")
