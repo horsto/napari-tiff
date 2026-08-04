@@ -7,12 +7,14 @@ from tifffile import TiffFile
 
 from base_data import (
     SCANIMAGE_SOFTWARE_SINGLE,
+    SCANIMAGE_SOFTWARE_SPLIT,
     scanimage_flat_two_channel_tiff,
     scanimage_frames_per_slice_multivolume_tiff,
     scanimage_frames_per_slice_single_volume_tiff,
     scanimage_split_files,
     scanimage_timeseries_tiff,
     scanimage_volumetric_tiff,
+    scanimage_volumetric_tiff_truncated,
     scanimage_volumetric_two_channel_tiff,
     write_scanimage_tiff,
 )
@@ -72,14 +74,38 @@ def test_compute_scanimage_dimensions_volumetric_with_flyback():
     assert dims.warning is None
 
 
-def test_compute_scanimage_dimensions_page_count_mismatch_falls_back():
+def test_compute_scanimage_dimensions_trailing_incomplete_timepoint_still_reshapes():
+    """A page count that isn't an exact multiple of the expected
+    pages-per-timepoint, but does cover at least one full timepoint, is a
+    real, legitimate case: an acquisition stopped mid-timepoint (e.g. the
+    user aborted recording). The confirmed structure must be kept -
+    `build_scanimage_layerdata` is responsible for dropping the trailing
+    partial timepoint, not `compute_scanimage_dimensions` falling back to
+    an unstructured flat interpretation.
+    """
     framedata = {
         "SI.hStackManager.enable": True,
         "SI.hStackManager.actualNumSlices": 3,
         "SI.hStackManager.numFramesPerVolume": 3,
         "SI.hStackManager.numFramesPerVolumeWithFlyback": 4,
     }
-    dims = compute_scanimage_dimensions(framedata, total_pages=10)  # not divisible by 4
+    dims = compute_scanimage_dimensions(framedata, total_pages=10)  # 2 full volumes + 2 extra pages
+    assert dims.axes == "TZYX"
+    assert dims.pages_per_step == 4
+    assert dims.warning is None
+
+
+def test_compute_scanimage_dimensions_too_few_pages_for_one_timepoint_falls_back():
+    """Fewer pages than a single timepoint needs is a genuine failure - not
+    a trailing-partial-timepoint case - and must still fall back.
+    """
+    framedata = {
+        "SI.hStackManager.enable": True,
+        "SI.hStackManager.actualNumSlices": 3,
+        "SI.hStackManager.numFramesPerVolume": 3,
+        "SI.hStackManager.numFramesPerVolumeWithFlyback": 4,
+    }
+    dims = compute_scanimage_dimensions(framedata, total_pages=2)  # < 4
     assert dims.axes == "IYX"
     assert dims.warning is not None
 
@@ -208,6 +234,22 @@ def test_reader_volumetric_scanimage_drops_flyback(scanimage_volumetric_tiff):
     result, kwargs, _ = layer_data_list[0]
     assert result.shape == (2, 3, 4, 4)
     expected = data.reshape(2, 4, 4, 4)[:, :3]
+    assert_array_equal(result.compute(), expected)
+    assert kwargs["axis_labels"] == ("t", "z", "y", "x")
+
+
+def test_reader_drops_trailing_incomplete_volume(scanimage_volumetric_tiff_truncated):
+    """Regression test for a real-world edge case: an acquisition stopped
+    mid-volume (10 pages on disk = 2 complete 4-page volumes + 2 leftover
+    pages of a 3rd, incomplete one). The confirmed volumetric structure
+    must be kept and the trailing partial volume simply dropped - not
+    discarded entirely into an unstructured flat interpretation.
+    """
+    path, data = scanimage_volumetric_tiff_truncated
+    layer_data_list = scanimage_reader_function(path)
+    result, kwargs, _ = layer_data_list[0]
+    assert result.shape == (2, 3, 4, 4)
+    expected = data[:8].reshape(2, 4, 4, 4)[:, :3]
     assert_array_equal(result.compute(), expected)
     assert kwargs["axis_labels"] == ("t", "z", "y", "x")
 
