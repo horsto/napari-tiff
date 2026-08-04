@@ -25,7 +25,7 @@ from typing import Any, Sequence
 import dask.array as da
 import tifffile
 import zarr
-from tifffile import TiffFile
+from tifffile import TiffFile, TiffPageSeries
 
 from napari_tiff.napari_tiff_multifile import natural_sort
 
@@ -337,19 +337,33 @@ def find_scanimage_series_files(path: str) -> list[str]:
 def _lazy_flat_page_array(path: str) -> tuple[da.Array, tuple[int, ...]]:
     """Return a lazy, page-indexed ``(n_pages, Y, X)`` dask array for `path`.
 
-    Built directly from each page's own store rather than `tif.series[0]`:
-    tifffile's built-in ScanImage series-shape inference derives its "Z"
-    axis purely from `SI.hStackManager.framesPerSlice` and the total page
-    count, which disagrees with the true on-disk layout once channels are
-    involved (`compute_scanimage_dimensions` implements the correct
-    interpretation instead, so this always starts from the raw pages).
+    Built from a single, manually-shaped `TiffPageSeries` covering all raw
+    pages - not `tif.series[0]`, whose built-in ScanImage series-shape
+    inference derives its "Z" axis purely from `SI.hStackManager.
+    framesPerSlice` and the total page count, which disagrees with the true
+    on-disk layout once channels are involved (`compute_scanimage_dimensions`
+    implements the correct interpretation instead, so this always starts
+    from a flat, explicitly-(re)shaped view of the raw pages). Constructing
+    one `TiffPageSeries` (and so one underlying Zarr store/file cache) for
+    the whole file - rather than one `page.aszarr()` store per page - keeps
+    per-file overhead constant instead of growing with page count, which
+    matters for large acquisitions (thousands of pages): each store/file
+    cache is itself a nontrivial Python object, and building `n_pages` of
+    them just to immediately `da.stack` them back together is pure waste.
+    Chunking is unaffected either way - a Zarr store built from a
+    multi-page series still exposes one chunk per page, so lazy per-frame
+    access during scrubbing is identical.
     """
     with TiffFile(path) as tif:
-        page_shape = tif.pages[0].shape
-        stores = [page.aszarr() for page in tif.pages]
-    arrays = [da.from_zarr(zarr.open(store, mode="r")) for store in stores]
-    combined = da.stack(arrays, axis=0)
-    return combined, (len(arrays),) + page_shape
+        pages = list(tif.pages)
+        page_shape = pages[0].shape
+        dtype = pages[0].dtype
+        series = TiffPageSeries(
+            pages, shape=(len(pages),) + page_shape, dtype=dtype, axes="IYX"
+        )
+        store = series.aszarr()
+    array = da.from_zarr(zarr.open(store, mode="r"))
+    return array, (len(pages),) + page_shape
 
 
 def build_scanimage_layerdata(
