@@ -195,6 +195,65 @@ def write_scanimage_tiff_multi(
     return path, data
 
 
+def write_scanimage_tiff_multi_truncated(
+    path,
+    software: str,
+    n_complete_steps: int,
+    extra_pages: int,
+    z_group_size: int = 1,
+    n_channels: int = 1,
+    shape=(4, 4),
+    dtype=np.int16,
+):
+    """Like `write_scanimage_tiff_multi`, but stops partway through what
+    would have been one more step - simulating an acquisition that was
+    aborted mid-timepoint (a real, legitimate case: not every step's worth
+    of on-disk pages needs to be complete).
+    """
+    pages = []  # list of (pixel_value, frame_number)
+    frame_number = 1
+    for step in range(n_complete_steps + 1):
+        for z in range(z_group_size):
+            for channel in range(n_channels):
+                pages.append((1000 * step + 10 * z + channel, frame_number))
+            frame_number += 1
+    pages_per_step = z_group_size * n_channels
+    pages = pages[: n_complete_steps * pages_per_step + extra_pages]
+
+    data = np.array(
+        [np.full(shape, value, dtype=dtype) for value, _fn in pages]
+    )
+    with tifffile.TiffWriter(path, bigtiff=True) as tif:
+        for i, (_value, fn) in enumerate(pages):
+            tif.write(
+                data[i],
+                software=software,
+                description=_scanimage_frame_description(fn),
+                contiguous=False,
+                metadata=None,
+            )
+    return path, data
+
+
+@pytest.fixture
+def scanimage_volumetric_tiff_truncated(tmp_path):
+    """Volumetric acquisition stopped mid-volume: 2 complete 4-page volumes
+    (`actualNumSlices=3` + 1 flyback page each) plus 2 extra pages of what
+    would have been a 3rd, incomplete volume - 10 pages total, not an exact
+    multiple of 4.
+    """
+    path = tmp_path / "scanimage_vol_truncated_00001.tif"
+    path, data = write_scanimage_tiff_multi_truncated(
+        path,
+        SCANIMAGE_SOFTWARE_SPLIT,
+        n_complete_steps=2,
+        extra_pages=2,
+        z_group_size=4,
+        n_channels=1,
+    )
+    return str(path), data
+
+
 @pytest.fixture
 def scanimage_flat_two_channel_tiff(tmp_path):
     """Plain (non-volumetric) 2-channel ScanImage timeseries: 5 timepoints."""

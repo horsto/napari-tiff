@@ -143,9 +143,13 @@ def compute_scanimage_dimensions(
     folded into an extra Z-position - confirmed against real single- and
     multi-volume acquisitions with 1-2 channels and `framesPerSlice` of 1
     or 20. Cross-validates `actualNumSlices x framesPerSlice ==
-    numFramesPerVolume` and the chosen page grouping against
-    `total_pages` before committing to a reshape; falls back to a flat
-    interpretation (with a warning) on any inconsistency.
+    numFramesPerVolume` before committing to a reshape; falls back to a
+    flat interpretation (with a warning) on metadata inconsistencies, or
+    if `total_pages` doesn't even cover one full timepoint. A page count
+    that covers at least one full timepoint but is not an exact multiple
+    of the expected pages-per-timepoint is interpreted as an acquisition
+    that stopped mid-timepoint; `build_scanimage_layerdata` drops that
+    trailing incomplete timepoint and preserves the confirmed structure.
     """
     if total_pages <= 0:
         return _flat_dims("no pages to interpret")
@@ -202,11 +206,11 @@ def compute_scanimage_dimensions(
         kept_raw_frames = frames_per_volume
 
     pages_per_step = on_disk_raw_frames * n_channels
-    if pages_per_step <= 0 or total_pages % pages_per_step:
+    if pages_per_step <= 0 or total_pages < pages_per_step:
         return _flat_dims(
-            f"total page count ({total_pages}) is not evenly divisible by "
-            f"the expected pages per timepoint ({pages_per_step} = "
-            f"{on_disk_raw_frames} raw frame(s) x {n_channels} channel(s)); "
+            f"total page count ({total_pages}) does not contain one complete "
+            f"timepoint ({pages_per_step} page(s) = {on_disk_raw_frames} "
+            f"raw frame(s) x {n_channels} channel(s)); "
             "falling back to a flat interpretation"
         )
 
