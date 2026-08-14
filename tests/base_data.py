@@ -17,6 +17,9 @@ SCANIMAGE_SOFTWARE_FRAMES_PER_SLICE = (
 SCANIMAGE_SOFTWARE_FRAMES_PER_SLICE_1VOL = (
     SCANIMAGE_DATA_DIR / "software_frames_per_slice_1vol.txt"
 ).read_text()
+SCANIMAGE_SOFTWARE_LOG_AVERAGE = (
+    SCANIMAGE_DATA_DIR / "software_log_average.txt"
+).read_text()
 
 
 def example_data_filepath(tmp_path, original_data):
@@ -250,6 +253,23 @@ def scanimage_volumetric_tiff_truncated(tmp_path):
         extra_pages=2,
         z_group_size=4,
         n_channels=1,
+    )
+    return str(path), data
+
+
+@pytest.fixture
+def scanimage_log_average_tiff(tmp_path):
+    """Volumetric acquisition with `SI.hScan2D.logAverageFactor=4` on top
+    of `framesPerSlice=20` (real metadata otherwise identical to the
+    `frames_per_slice` fixtures above: `actualNumSlices=7`,
+    `numFramesPerVolume=140`, `numFramesPerVolumeWithFlyback=141`).
+    ScanImage on-the-fly averages 4 raw frames into each saved frame, so
+    only 140/4=5 frames per Z-position (plus 1 flyback) are actually
+    written per volume - 36 on-disk pages/volume, not 141.
+    """
+    path = tmp_path / "scanimage_log_average_00001.tif"
+    path, data = write_scanimage_tiff_multi(
+        path, SCANIMAGE_SOFTWARE_LOG_AVERAGE, n_steps=2, z_group_size=36, n_channels=1
     )
     return str(path), data
 

@@ -11,6 +11,7 @@ from base_data import (
     scanimage_flat_two_channel_tiff,
     scanimage_frames_per_slice_multivolume_tiff,
     scanimage_frames_per_slice_single_volume_tiff,
+    scanimage_log_average_tiff,
     scanimage_split_files,
     scanimage_timeseries_tiff,
     scanimage_volumetric_tiff,
@@ -199,6 +200,110 @@ def test_compute_scanimage_dimensions_multivolume_frames_per_slice():
     assert dims.frames_per_slice == 20
     assert dims.pages_per_step == 141
     assert dims.warning is None
+
+
+def test_compute_scanimage_dimensions_log_average_factor_shrinks_on_disk_frames():
+    """SI.hScan2D.logAverageFactor > 1 on-the-fly averages that many raw
+    scanner frames into a single saved frame per Z-position, so what's on
+    disk uses framesPerSlice / logAverageFactor frames per Z-position -
+    not the raw framesPerSlice value the rest of hStackManager's metadata
+    is expressed in terms of (reported bug: a real file with
+    framesPerSlice=logAverageFactor collapsed to 1 on-disk frame per
+    Z-position was misdiagnosed as a metadata inconsistency).
+    """
+    framedata = {
+        "SI.hStackManager.enable": True,
+        "SI.hStackManager.actualNumSlices": 40,
+        "SI.hStackManager.numFramesPerVolume": 16000,
+        "SI.hStackManager.numFramesPerVolumeWithFlyback": 16000,
+        "SI.hStackManager.framesPerSlice": 400,
+        "SI.hChannels.channelSave": [1, 2],
+        "SI.hScan2D.logAverageFactor": 400,
+    }
+    dims = compute_scanimage_dimensions(framedata, total_pages=80)  # 40 slices x 2 channels
+    assert dims.axes == "TZCYX"
+    assert dims.frames_per_slice == 1
+    assert dims.z_count == 40
+    assert dims.on_disk_raw_frames == 40
+    assert dims.kept_raw_frames == 40
+    assert dims.pages_per_step == 80
+    assert dims.log_average_factor == 400
+    assert dims.raw_frames_per_slice == 400
+    assert dims.physical_frames_per_volume == 16000
+    assert dims.warning is None
+
+
+def test_compute_scanimage_dimensions_log_average_factor_keeps_f_axis_and_flyback():
+    """framesPerSlice / logAverageFactor > 1 still produces an `'F'` axis,
+    and a flyback frame (raw metadata says numFramesPerVolumeWithFlyback
+    > numFramesPerVolume) is still added as a single extra on-disk page,
+    unaffected by averaging.
+    """
+    framedata = {
+        "SI.hStackManager.enable": True,
+        "SI.hStackManager.actualNumSlices": 7,
+        "SI.hStackManager.numFramesPerVolume": 140,
+        "SI.hStackManager.numFramesPerVolumeWithFlyback": 141,
+        "SI.hStackManager.framesPerSlice": 20,
+        "SI.hScan2D.logAverageFactor": 4,
+    }
+    dims = compute_scanimage_dimensions(framedata, total_pages=36)
+    assert dims.axes == "TFZYX"
+    assert dims.frames_per_slice == 5  # 20 / 4
+    assert dims.z_count == 7
+    assert dims.kept_raw_frames == 35  # 7 x 5
+    assert dims.on_disk_raw_frames == 36  # + 1 flyback
+    assert dims.pages_per_step == 36
+    assert dims.log_average_factor == 4
+    assert dims.raw_frames_per_slice == 20
+    assert dims.physical_frames_per_volume == 141
+    assert dims.warning is None
+
+
+def test_compute_scanimage_dimensions_log_average_factor_must_divide_evenly():
+    """If framesPerSlice isn't an exact multiple of logAverageFactor, the
+    averaging model doesn't apply cleanly - fall back rather than guess.
+    """
+    framedata = {
+        "SI.hStackManager.enable": True,
+        "SI.hStackManager.actualNumSlices": 7,
+        "SI.hStackManager.numFramesPerVolume": 140,
+        "SI.hStackManager.numFramesPerVolumeWithFlyback": 141,
+        "SI.hStackManager.framesPerSlice": 20,
+        "SI.hScan2D.logAverageFactor": 3,  # 20 % 3 != 0
+    }
+    dims = compute_scanimage_dimensions(framedata, total_pages=141)
+    assert dims.axes == "IYX"
+    assert dims.warning is not None
+
+
+def test_reader_log_average_factor_reshapes_correctly(scanimage_log_average_tiff):
+    """Reader-level regression test for the reported bug."""
+    path, data = scanimage_log_average_tiff  # 2 volumes, 72 pages, 36/volume
+    layer_data_list = scanimage_reader_function(path)
+    result, kwargs, _layer_type = layer_data_list[0]
+    assert result.shape == (2, 5, 7, 4, 4)
+    assert kwargs["axis_labels"] == ("t", "f", "z", "y", "x")
+    # on disk: Z-outer, frame-repeat-inner within the kept raw frames
+    expected = data.reshape(2, 36, 4, 4)[:, :35].reshape(2, 7, 5, 4, 4).transpose(0, 2, 1, 3, 4)
+    assert_array_equal(result.compute(), expected)
+
+
+def test_scale_uses_physical_not_on_disk_frame_counts(scanimage_log_average_tiff):
+    """T (and F) axis scale must reflect the true physical acquisition
+    time - which on-the-fly averaging shrinks on disk but does not
+    actually speed up - not the reduced on-disk frame counts.
+    """
+    path, _data = scanimage_log_average_tiff
+    with TiffFile(path) as tif:
+        kwargs = get_scanimage_metadata(tif)
+    frame_rate = 30.0021  # SI.hRoiManager.scanFrameRate in software_log_average.txt
+    t_index = kwargs["axis_labels"].index("t")
+    f_index = kwargs["axis_labels"].index("f")
+    z_index = kwargs["axis_labels"].index("z")
+    assert kwargs["scale"][t_index] == pytest.approx(141 / frame_rate)
+    assert kwargs["scale"][f_index] == pytest.approx(4 / frame_rate)
+    assert kwargs["scale"][z_index] == pytest.approx(5.0)
 
 
 def test_get_scanimage_framedata_fallback_to_software_tag(scanimage_timeseries_tiff):

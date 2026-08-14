@@ -347,16 +347,18 @@ def get_scanimage_metadata(tif: TiffFile) -> dict[str, Any]:
     frame_rate = framedata.get("SI.hRoiManager.scanFrameRate")
     zs = framedata.get("SI.hStackManager.zs")
     z_spacing = None
-    if isinstance(zs, (list, tuple)) and dims.frames_per_slice >= 1 and dims.z_count > 1:
-        # `zs` lists one entry per on-disk raw frame (Z-outer,
-        # frame-repeat-inner - see ScanImageDims), so each Z-position's
-        # value is repeated `frames_per_slice` times in a row; sample
-        # every `frames_per_slice`-th entry to recover the true
+    if isinstance(zs, (list, tuple)) and dims.raw_frames_per_slice >= 1 and dims.z_count > 1:
+        # `zs` lists one entry per *raw* (pre-averaging) frame - Z-outer,
+        # frame-repeat-inner - so each Z-position's value is repeated
+        # `raw_frames_per_slice` times in a row (not `frames_per_slice`,
+        # which is already divided by `SI.hScan2D.logAverageFactor` and so
+        # describes what's on disk, not `zs`'s own granularity); sample
+        # every `raw_frames_per_slice`-th entry to recover the true
         # per-Z-position values before differencing. Naively differencing
         # consecutive raw entries would average in the many zero-diffs
         # between repeats of the same Z-position, badly underestimating
         # the real step size.
-        z_positions = zs[: dims.frames_per_slice * dims.z_count : dims.frames_per_slice]
+        z_positions = zs[: dims.raw_frames_per_slice * dims.z_count : dims.raw_frames_per_slice]
         if len(z_positions) > 1:
             diffs = [abs(b - a) for a, b in zip(z_positions, z_positions[1:])]
             z_spacing = sum(diffs) / len(diffs)
@@ -380,15 +382,18 @@ def get_scanimage_metadata(tif: TiffFile) -> dict[str, Any]:
             scale.append(xy_scale[axis])
             units.append(xy_units[axis])
         elif axis == "T" and frame_rate:
-            # on_disk_raw_frames (not kept_raw_frames) so the flyback's
-            # real physical time cost is reflected in the volume period
-            scale.append(dims.on_disk_raw_frames / float(frame_rate))
+            # physical_frames_per_volume (not on_disk_raw_frames) so both
+            # the flyback's real physical time cost and any on-the-fly
+            # frame averaging (SI.hScan2D.logAverageFactor - which shrinks
+            # what's written to disk without making the acquisition any
+            # faster) are reflected in the volume period
+            scale.append(dims.physical_frames_per_volume / float(frame_rate))
             units.append("s")
         elif axis == "Z" and z_spacing is not None:
             scale.append(z_spacing)
             units.append("\u00b5m")
         elif axis == "F" and frame_rate:
-            scale.append(1.0 / float(frame_rate))
+            scale.append(dims.log_average_factor / float(frame_rate))
             units.append("s")
         else:
             scale.append(1.0)
