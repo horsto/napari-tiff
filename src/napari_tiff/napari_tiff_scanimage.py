@@ -101,6 +101,19 @@ class ScanImageDims:
     `frames_per_slice` repeated frames each, on disk Z-outer/frame-repeat-
     inner - `build_scanimage_layerdata` transposes this to frame-repeat-
     major/Z-minor to match `axes`.
+
+    `on_disk_raw_frames`, `kept_raw_frames`, and `frames_per_slice` all
+    describe what's actually *written to disk*, which can be smaller than
+    what `SI.hStackManager` reports when `SI.hScan2D.logAverageFactor` > 1
+    (ScanImage on-the-fly averages that many raw scanner frames into a
+    single saved frame per Z-position). `log_average_factor`,
+    `raw_frames_per_slice`, and `physical_frames_per_volume` preserve the
+    *un-averaged* metadata values - needed for correctly sampling
+    `SI.hStackManager.zs` (which has one entry per raw, pre-averaging
+    frame) and for computing the true physical duration of a
+    volume/frame-repeat step (averaging doesn't make the acquisition
+    itself any faster) - and default to `1` for the common, non-averaged
+    case.
     """
 
     axes: str
@@ -110,6 +123,9 @@ class ScanImageDims:
     z_count: int
     frames_per_slice: int
     n_channels: int
+    log_average_factor: int = 1
+    raw_frames_per_slice: int = 1
+    physical_frames_per_volume: int = 1
     warning: str | None = None
 
 
@@ -122,6 +138,9 @@ def _flat_dims(reason: str | None = None) -> ScanImageDims:
         z_count=1,
         frames_per_slice=1,
         n_channels=1,
+        log_average_factor=1,
+        raw_frames_per_slice=1,
+        physical_frames_per_volume=1,
         warning=reason,
     )
 
@@ -166,6 +185,18 @@ def compute_scanimage_dimensions(
         frames_per_slice = 1
         kept_raw_frames = 1
         on_disk_raw_frames = 1
+        raw_frames_per_slice = 1
+        # logAverageFactor applies regardless of whether a stack is being
+        # acquired: each saved frame still represents that many averaged
+        # raw scans, so the true physical time per (flat) T-step scales
+        # with it even though the file structure itself is unaffected.
+        try:
+            log_average_factor = int(framedata.get("SI.hScan2D.logAverageFactor") or 1)
+            if log_average_factor < 1:
+                log_average_factor = 1
+        except (TypeError, ValueError):
+            log_average_factor = 1
+        physical_frames_per_volume = log_average_factor
     else:
         n_slices = framedata.get("SI.hStackManager.actualNumSlices")
         frames_per_volume = framedata.get("SI.hStackManager.numFramesPerVolume")
@@ -181,29 +212,53 @@ def compute_scanimage_dimensions(
         try:
             n_slices = int(n_slices)
             frames_per_volume = int(frames_per_volume)
-            on_disk_raw_frames = int(frames_per_volume_flyback or frames_per_volume)
+            physical_frames_per_volume = int(frames_per_volume_flyback or frames_per_volume)
         except (TypeError, ValueError):
             return _flat_dims(
                 "could not parse hStackManager slice-count fields as integers"
             )
-        if not (0 < frames_per_volume <= on_disk_raw_frames):
+        if not (0 < frames_per_volume <= physical_frames_per_volume):
             return _flat_dims("inconsistent frames-per-volume metadata")
+        has_flyback = physical_frames_per_volume > frames_per_volume
 
         try:
-            frames_per_slice = int(framedata.get("SI.hStackManager.framesPerSlice"))
-            if frames_per_slice < 1:
-                frames_per_slice = 1
+            raw_frames_per_slice = int(framedata.get("SI.hStackManager.framesPerSlice"))
+            if raw_frames_per_slice < 1:
+                raw_frames_per_slice = 1
         except (TypeError, ValueError):
-            frames_per_slice = 1
+            raw_frames_per_slice = 1
 
-        if n_slices * frames_per_slice != frames_per_volume:
+        if n_slices * raw_frames_per_slice != frames_per_volume:
             return _flat_dims(
                 f"actualNumSlices ({n_slices}) x framesPerSlice "
-                f"({frames_per_slice}) does not match numFramesPerVolume "
+                f"({raw_frames_per_slice}) does not match numFramesPerVolume "
                 f"({frames_per_volume}); falling back to a flat interpretation"
             )
+
+        # SI.hScan2D.logAverageFactor on-the-fly averages that many raw
+        # scanner frames into a single saved frame at each Z-position
+        # before writing to disk, so what's actually on disk uses
+        # raw_frames_per_slice / logAverageFactor frames per Z-position -
+        # not the raw framesPerSlice value the rest of hStackManager's
+        # metadata (and `SI.hStackManager.zs`) is expressed in terms of.
+        try:
+            log_average_factor = int(framedata.get("SI.hScan2D.logAverageFactor") or 1)
+            if log_average_factor < 1:
+                log_average_factor = 1
+        except (TypeError, ValueError):
+            log_average_factor = 1
+
+        if raw_frames_per_slice % log_average_factor:
+            return _flat_dims(
+                f"framesPerSlice ({raw_frames_per_slice}) is not evenly "
+                f"divisible by logAverageFactor ({log_average_factor}); "
+                "falling back to a flat interpretation"
+            )
+        frames_per_slice = raw_frames_per_slice // log_average_factor
+
         z_count = n_slices
-        kept_raw_frames = frames_per_volume
+        kept_raw_frames = z_count * frames_per_slice
+        on_disk_raw_frames = kept_raw_frames + (1 if has_flyback else 0)
 
     pages_per_step = on_disk_raw_frames * n_channels
     if pages_per_step <= 0 or total_pages < pages_per_step:
@@ -234,6 +289,9 @@ def compute_scanimage_dimensions(
         z_count=z_count,
         frames_per_slice=frames_per_slice,
         n_channels=n_channels,
+        log_average_factor=log_average_factor,
+        raw_frames_per_slice=raw_frames_per_slice,
+        physical_frames_per_volume=physical_frames_per_volume,
     )
 
 
