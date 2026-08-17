@@ -18,6 +18,7 @@ from base_data import (
     scanimage_volumetric_tiff_truncated,
     scanimage_volumetric_two_channel_tiff,
     write_scanimage_tiff,
+    write_scanimage_tiff_multi_truncated,
 )
 from napari_tiff.napari_tiff_reader import (
     directory_reader_function,
@@ -27,6 +28,7 @@ from napari_tiff.napari_tiff_reader import (
 from napari_tiff.napari_tiff_metadata import get_scanimage_metadata
 from napari_tiff.napari_tiff_scanimage import (
     compute_scanimage_dimensions,
+    filter_compatible_scanimage_files,
     find_scanimage_series_files,
     get_scanimage_framedata,
 )
@@ -390,6 +392,96 @@ def test_reader_explicit_noncontiguous_subset_warns(scanimage_split_files):
         axis=0,
     )
     assert_array_equal(result.compute(), expected)
+
+
+def test_reader_explicit_list_with_truncated_file_still_concatenates(tmp_path):
+    """A file that stopped mid-volume must not be excluded outright - only
+    its own trailing incomplete volume is dropped (same as the single-file
+    case), so it can still be concatenated with complete files from the
+    same acquisition, regardless of its position in the list.
+    """
+    path1 = tmp_path / "acq_00003_00001.tif"
+    path2 = tmp_path / "acq_00003_00002.tif"
+    _p1, data1 = write_scanimage_tiff(
+        path1, SCANIMAGE_SOFTWARE_SPLIT, n_pages=8, start_frame_number=1
+    )
+    # 2 complete 4-page volumes + 2 leftover pages of a 3rd, incomplete one
+    _p2, data2 = write_scanimage_tiff_multi_truncated(
+        path2,
+        SCANIMAGE_SOFTWARE_SPLIT,
+        n_complete_steps=2,
+        extra_pages=2,
+        z_group_size=4,
+        n_channels=1,
+    )
+    # the truncated file's frame numbers restart at 1 rather than
+    # continuing from file 1's - expected here, and unrelated to whether
+    # concatenation itself works correctly
+    with pytest.warns(UserWarning, match="not contiguous"):
+        layer_data_list = scanimage_reader_function([str(path1), str(path2)])
+    assert len(layer_data_list) == 1
+    result, kwargs, _layer_type = layer_data_list[0]
+    assert result.shape == (4, 3, 4, 4)  # 2 complete volumes from each file
+    expected = np.concatenate(
+        [
+            data1.reshape(2, 4, 4, 4)[:, :3],
+            data2[:8].reshape(2, 4, 4, 4)[:, :3],
+        ],
+        axis=0,
+    )
+    assert_array_equal(result.compute(), expected)
+    assert kwargs["axis_labels"] == ("t", "z", "y", "x")
+
+
+def test_reader_explicit_list_excludes_incompatible_file_and_opens_it_independently(
+    tmp_path,
+):
+    """Dropping several files together (napari's stack mode) must sanity-
+    check that they're actually compatible (same planes/channels/etc.),
+    not blindly reshape every file using the first file's structure. A
+    file with genuinely different ScanImage metadata is excluded from the
+    combined stack, but still opened as its own independent layer so
+    nothing is silently lost.
+    """
+    path1 = tmp_path / "acq_00004_00001.tif"
+    path2 = tmp_path / "acq_00004_00002.tif"
+    incompatible = tmp_path / "unrelated_00001.tif"
+    _p1, data1 = write_scanimage_tiff(
+        path1, SCANIMAGE_SOFTWARE_SPLIT, n_pages=8, start_frame_number=1
+    )
+    _p2, data2 = write_scanimage_tiff(
+        path2, SCANIMAGE_SOFTWARE_SPLIT, n_pages=8, start_frame_number=9
+    )
+    _p3, data3 = write_scanimage_tiff(incompatible, SCANIMAGE_SOFTWARE_SINGLE, n_pages=5)
+
+    layer_data_list = scanimage_reader_function(
+        [str(incompatible), str(path2), str(path1)]
+    )
+    assert len(layer_data_list) == 2  # 1 combined stack + 1 independent layer
+
+    shapes = {ld[0].shape for ld in layer_data_list}
+    assert shapes == {(4, 3, 4, 4), (5, 4, 4)}
+
+    combined = next(ld for ld in layer_data_list if ld[0].shape == (4, 3, 4, 4))
+    expected_combined = np.concatenate(
+        [data1.reshape(2, 4, 4, 4)[:, :3], data2.reshape(2, 4, 4, 4)[:, :3]], axis=0
+    )
+    assert_array_equal(combined[0].compute(), expected_combined)
+
+    independent = next(ld for ld in layer_data_list if ld[0].shape == (5, 4, 4))
+    assert_array_equal(independent[0].compute(), data3)
+
+
+def test_filter_compatible_scanimage_files_keeps_only_matching_metadata(tmp_path):
+    path1 = tmp_path / "a.tif"
+    path2 = tmp_path / "b.tif"
+    path3 = tmp_path / "c.tif"
+    write_scanimage_tiff(path1, SCANIMAGE_SOFTWARE_SPLIT, n_pages=8, start_frame_number=1)
+    write_scanimage_tiff(path2, SCANIMAGE_SOFTWARE_SPLIT, n_pages=8, start_frame_number=9)
+    write_scanimage_tiff(path3, SCANIMAGE_SOFTWARE_SINGLE, n_pages=5)
+
+    result = filter_compatible_scanimage_files([str(path1), str(path2), str(path3)])
+    assert result == [str(path1), str(path2)]
 
 
 def test_build_scanimage_layerdata_uses_real_page_count(scanimage_timeseries_tiff):

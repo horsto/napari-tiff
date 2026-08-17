@@ -37,6 +37,12 @@ _PER_FILE_FRAMEDATA_KEYS = frozenset(
         "SI.hScan2D.logFileCounter",
         "SI.hScan2D.logFilePath",
         "SI.hScan2D.logFileStem",
+        # PMT/detector DC offsets, re-measured by ScanImage at the start of
+        # each new file in a continuous acquisition - confirmed to differ
+        # (while everything structural stays identical) between two real
+        # sibling files of the same split acquisition.
+        "SI.hScan2D.channelOffsets",
+        "SI.hChannels.channelOffset",
     }
 )
 
@@ -145,10 +151,17 @@ def _flat_dims(reason: str | None = None) -> ScanImageDims:
     )
 
 
-def compute_scanimage_dimensions(
-    framedata: dict[str, Any], total_pages: int
-) -> ScanImageDims:
-    """Decide how to reshape a ScanImage page stack into T[,Z][,F][,C],Y,X.
+def _compute_scanimage_structure(framedata: dict[str, Any]) -> ScanImageDims:
+    """Decide the shape of one ScanImage timepoint, independent of page count.
+
+    Does everything `compute_scanimage_dimensions` does *except* checking
+    whether any particular file's `total_pages` is enough to hold even one
+    timepoint - so this can be used to compare the *structure* two files'
+    metadata implies (e.g. when checking whether several dropped files
+    belong to the same acquisition) without one file's truncation making
+    that comparison meaningless. `pages_per_step` is still computed here;
+    `compute_scanimage_dimensions` is the one that decides whether a given
+    `total_pages` actually satisfies it.
 
     Gates volumetric interpretation on `SI.hStackManager.enable`/
     `SI.hFastZ.enable` (never on the mere presence of slice-count fields,
@@ -163,16 +176,8 @@ def compute_scanimage_dimensions(
     multi-volume acquisitions with 1-2 channels and `framesPerSlice` of 1
     or 20. Cross-validates `actualNumSlices x framesPerSlice ==
     numFramesPerVolume` before committing to a reshape; falls back to a
-    flat interpretation (with a warning) on metadata inconsistencies, or
-    if `total_pages` doesn't even cover one full timepoint. A page count
-    that covers at least one full timepoint but is not an exact multiple
-    of the expected pages-per-timepoint is interpreted as an acquisition
-    that stopped mid-timepoint; `build_scanimage_layerdata` drops that
-    trailing incomplete timepoint and preserves the confirmed structure.
+    flat interpretation (with a warning) on metadata inconsistencies.
     """
-    if total_pages <= 0:
-        return _flat_dims("no pages to interpret")
-
     channel_save = framedata.get("SI.hChannels.channelSave")
     n_channels = len(channel_save) if isinstance(channel_save, (list, tuple)) else 1
 
@@ -261,13 +266,8 @@ def compute_scanimage_dimensions(
         on_disk_raw_frames = kept_raw_frames + (1 if has_flyback else 0)
 
     pages_per_step = on_disk_raw_frames * n_channels
-    if pages_per_step <= 0 or total_pages < pages_per_step:
-        return _flat_dims(
-            f"total page count ({total_pages}) does not contain one complete "
-            f"timepoint ({pages_per_step} page(s) = {on_disk_raw_frames} "
-            f"raw frame(s) x {n_channels} channel(s)); "
-            "falling back to a flat interpretation"
-        )
+    if pages_per_step <= 0:
+        return _flat_dims("could not determine a positive pages-per-timepoint count")
 
     # 'F' (repeated frames, a second time-like axis) is grouped with 'T'
     # rather than 'Z': napari's 3D rendering mode treats the *last* 3 axes
@@ -293,6 +293,37 @@ def compute_scanimage_dimensions(
         raw_frames_per_slice=raw_frames_per_slice,
         physical_frames_per_volume=physical_frames_per_volume,
     )
+
+
+def compute_scanimage_dimensions(
+    framedata: dict[str, Any], total_pages: int
+) -> ScanImageDims:
+    """Decide how to reshape a ScanImage page stack into T[,Z][,F][,C],Y,X.
+
+    Computes the acquisition's structure via `_compute_scanimage_structure`
+    (see there for the reshaping rules), then checks that `total_pages`
+    covers at least one full timepoint of that structure; falls back to a
+    flat interpretation (with a warning) if it doesn't. A page count that
+    covers at least one full timepoint but is not an exact multiple of the
+    expected pages-per-timepoint is interpreted as an acquisition that
+    stopped mid-timepoint; `build_scanimage_layerdata` drops that trailing
+    incomplete timepoint and preserves the confirmed structure.
+    """
+    if total_pages <= 0:
+        return _flat_dims("no pages to interpret")
+
+    dims = _compute_scanimage_structure(framedata)
+    if dims.warning:
+        return dims
+
+    if total_pages < dims.pages_per_step:
+        return _flat_dims(
+            f"total page count ({total_pages}) does not contain one complete "
+            f"timepoint ({dims.pages_per_step} page(s) = {dims.on_disk_raw_frames} "
+            f"raw frame(s) x {dims.n_channels} channel(s)); "
+            "falling back to a flat interpretation"
+        )
+    return dims
 
 
 def _parse_scanimage_filename(path: str) -> tuple[str, str, int | None]:
@@ -342,11 +373,60 @@ def warn_on_frame_number_gaps(paths: Sequence[str]) -> None:
         previous_last = last if last is not None else previous_last
 
 
+def filter_compatible_scanimage_files(paths: Sequence[str]) -> list[str]:
+    """Return the subset of `paths` that share the same static ScanImage configuration.
+
+    The first path that can be opened as a ScanImage file becomes the
+    reference; every other path is kept only if its own FrameData matches
+    the reference exactly (ignoring `_PER_FILE_FRAMEDATA_KEYS`, which
+    legitimately vary between files of the same acquisition). This is a
+    strict, whole-metadata comparison rather than checking only the
+    fields `_compute_scanimage_structure` happens to use today, so it
+    also catches unexpected future differences. Non-ScanImage or
+    unreadable paths, and paths whose metadata differs from the
+    reference, are dropped (with a warning) rather than risking a wrong
+    reshape; order is preserved for whatever remains. Used both for
+    filename-based sibling auto-discovery (`find_scanimage_series_files`)
+    and for an explicit multi-file selection (`napari_tiff_reader.
+    scanimage_reader_function`).
+    """
+    reference_framedata = None
+    confirmed = []
+    for candidate in paths:
+        try:
+            with TiffFile(candidate) as tif:
+                if not tif.is_scanimage:
+                    log_warning(
+                        f"{candidate!r} is not a ScanImage file; excluding it "
+                        "from the combined acquisition"
+                    )
+                    continue
+                framedata = _comparable_framedata(get_scanimage_framedata(tif))
+        except Exception as exc:
+            log_warning(f"failed to inspect potential ScanImage file {candidate!r}: {exc}")
+            continue
+
+        if reference_framedata is None:
+            reference_framedata = framedata
+            confirmed.append(candidate)
+        elif framedata == reference_framedata:
+            confirmed.append(candidate)
+        else:
+            log_warning(
+                f"{candidate!r} has ScanImage metadata that differs from the "
+                "rest of this selection (e.g. channels, volume/frame "
+                "structure, or acquisition settings); excluding it from the "
+                "combined acquisition"
+            )
+
+    return confirmed
+
+
 def find_scanimage_series_files(path: str) -> list[str]:
     """Find and order sibling files belonging to the same ScanImage acquisition as `path`.
 
     Returns just `[path]` if it uses the single-file naming form, or if no
-    siblings pass the static-metadata check below.
+    siblings pass the static-metadata check in `_filter_compatible_scanimage_files`.
     """
     path = Path(path)
     base, acquisition, _file_index = _parse_scanimage_filename(str(path))
@@ -364,30 +444,7 @@ def find_scanimage_series_files(path: str) -> list[str]:
         return [str(path)]
 
     siblings = natural_sort(siblings)
-
-    reference_framedata = None
-    confirmed = []
-    for sibling in siblings:
-        try:
-            with TiffFile(sibling) as tif:
-                if not tif.is_scanimage:
-                    continue
-                framedata = _comparable_framedata(get_scanimage_framedata(tif))
-        except Exception as exc:
-            log_warning(f"failed to inspect potential ScanImage sibling {sibling!r}: {exc}")
-            continue
-
-        if reference_framedata is None:
-            reference_framedata = framedata
-            confirmed.append(sibling)
-        elif framedata == reference_framedata:
-            confirmed.append(sibling)
-        else:
-            log_warning(
-                f"{sibling!r} looked like a sibling of {path!r} by file name, "
-                "but its ScanImage metadata differs - excluding it from the "
-                "combined acquisition"
-            )
+    confirmed = filter_compatible_scanimage_files(siblings)
 
     if not confirmed:
         return [str(path)]

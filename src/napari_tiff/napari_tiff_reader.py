@@ -26,6 +26,7 @@ from napari_tiff.napari_tiff_multifile import (
 from napari_tiff.napari_tiff_scanimage import (
     build_scanimage_layerdata,
     compute_scanimage_dimensions,
+    filter_compatible_scanimage_files,
     find_scanimage_series_files,
     get_scanimage_framedata,
     warn_on_frame_number_gaps,
@@ -129,16 +130,17 @@ def scanimage_reader_function(path: PathLike) -> List[LayerData]:
 
     A single `path` auto-discovers and stitches its split-acquisition
     siblings (see `find_scanimage_series_files`). A list `path` (napari's
-    stack mode) is stitched as given instead - any subset, any order,
-    naturally sorted by file index. Falls back to `reader_function` on the
-    first path if anything above fails.
+    stack mode - Shift-drag or *File > Open Files as Stack...*) is handled
+    by `_scanimage_reader_for_explicit_list` instead: naturally sorted,
+    checked for metadata compatibility, and stitched. Falls back to
+    `reader_function` on the first path if anything above fails for the
+    single-path case.
     """
+    if isinstance(path, list):
+        return _scanimage_reader_for_explicit_list([str(p) for p in path])
+
     try:
-        if isinstance(path, list):
-            paths = natural_sort([str(p) for p in path])
-            warn_on_frame_number_gaps(paths)
-        else:
-            paths = find_scanimage_series_files(str(path))
+        paths = find_scanimage_series_files(str(path))
 
         with TiffFile(paths[0]) as tif:
             framedata = get_scanimage_framedata(tif)
@@ -149,8 +151,60 @@ def scanimage_reader_function(path: PathLike) -> List[LayerData]:
         return [(data, metadata_kwargs, "image")]
     except Exception as exc:
         log_warning(f"scanimage reader: {exc}; falling back to generic tiff reader")
-        first = path[0] if isinstance(path, list) else path
-        return reader_function(first)
+        return reader_function(path)
+
+
+def _scanimage_reader_for_explicit_list(paths: List[str]) -> List[LayerData]:
+    """Combine an explicit list of ScanImage files (napari's stack mode).
+
+    Naturally sorts the given paths, then keeps only the subset whose
+    ScanImage metadata is mutually compatible (same channels, volume/
+    frame structure, etc. - see `filter_compatible_scanimage_files`).
+    Any excluded files are still opened, just as independent layers, so
+    nothing is silently dropped from view; a warning explains why each
+    was excluded from the combined stack. Each kept file's own trailing
+    incomplete timepoint (e.g. a recording that was stopped early) is
+    dropped individually by `build_scanimage_layerdata`, so a truncated
+    file can still be mixed in with complete ones from the same
+    acquisition. Falls back to opening every path independently if
+    nothing above succeeds.
+    """
+    paths = natural_sort(paths)
+
+    try:
+        compatible = filter_compatible_scanimage_files(paths)
+    except Exception as exc:
+        log_warning(f"scanimage reader: {exc}; opening files as independent layers")
+        compatible = []
+
+    layers: List[LayerData] = []
+    if compatible:
+        warn_on_frame_number_gaps(compatible)
+        try:
+            with TiffFile(compatible[0]) as tif:
+                framedata = get_scanimage_framedata(tif)
+                dims = compute_scanimage_dimensions(framedata, len(tif.pages))
+                metadata_kwargs = get_metadata(tif)
+            data, _axes = build_scanimage_layerdata(compatible, dims)
+            layers.append((data, metadata_kwargs, "image"))
+        except Exception as exc:
+            log_warning(
+                f"scanimage reader: {exc}; opening {compatible!r} as "
+                "independent layers instead of a combined stack"
+            )
+            compatible = []
+
+    excluded = paths if not compatible else [p for p in paths if p not in compatible]
+    for p in excluded:
+        try:
+            # single-path mode: still ScanImage-aware (correct volumetric
+            # reshaping, its own sibling auto-discovery, etc.), just not
+            # merged into the incompatible combined stack above.
+            layers.extend(scanimage_reader_function(p))
+        except Exception as exc:
+            log_warning(f"scanimage reader: failed to open {p!r} independently: {exc}")
+
+    return layers
 
 
 def multifile_reader_function(path: PathLike) -> List[LayerData]:
