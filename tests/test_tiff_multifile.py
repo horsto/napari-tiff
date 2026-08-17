@@ -140,8 +140,8 @@ def test_multifile_reader_concatenates_existing_leading_axis(tmp_path):
     Regression test: napari raises ``ValueError: axis_labels=(...) must
     have length ndim=...`` if `scale`/`units`/`channel_axis` are shifted as
     though a brand new axis were added, when in fact the per-file leading
-    axis was only relabeled/extended (e.g. a folder of suite2p-style
-    ``reg_tif`` chunks, each already a 3D (frames, Y, X) stack).
+    axis was only relabeled/extended (e.g. a folder of chunked recordings,
+    each already a 3D (frames, Y, X) stack).
     """
     chunk_a = np.random.randint(0, 255, (3, 5, 5)).astype(np.uint8)
     chunk_b = np.random.randint(0, 255, (4, 5, 5)).astype(np.uint8)
