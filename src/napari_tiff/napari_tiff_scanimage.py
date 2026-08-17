@@ -29,23 +29,6 @@ from tifffile import TiffFile, TiffPageSeries
 
 from napari_tiff.napari_tiff_multifile import natural_sort
 
-# FrameData keys that are expected to legitimately vary between files
-# belonging to the very same acquisition and must be excluded when checking
-# whether two files share the same static configuration.
-_PER_FILE_FRAMEDATA_KEYS = frozenset(
-    {
-        "SI.hScan2D.logFileCounter",
-        "SI.hScan2D.logFilePath",
-        "SI.hScan2D.logFileStem",
-        # PMT/detector DC offsets, re-measured by ScanImage at the start of
-        # each new file in a continuous acquisition - confirmed to differ
-        # (while everything structural stays identical) between two real
-        # sibling files of the same split acquisition.
-        "SI.hScan2D.channelOffsets",
-        "SI.hChannels.channelOffset",
-    }
-)
-
 # `<base>_<acquisition>_<fileIndex>.<ext>` (split/multi-file acquisition) or
 # `<base>_<acquisition>.<ext>` (single-file acquisition).
 _MULTI_FILE_RE = re.compile(r"^(?P<base>.+?)_(?P<acquisition>\d+)_(?P<file_index>\d+)$")
@@ -341,10 +324,6 @@ def _parse_scanimage_filename(path: str) -> tuple[str, str, int | None]:
     return stem, "", None
 
 
-def _comparable_framedata(framedata: dict[str, Any]) -> dict[str, Any]:
-    return {k: v for k, v in framedata.items() if k not in _PER_FILE_FRAMEDATA_KEYS}
-
-
 def _frame_number(page: Any) -> int | None:
     match = _FRAME_NUMBER_RE.search(page.description or "")
     return int(match.group(1)) if match else None
@@ -373,50 +352,78 @@ def warn_on_frame_number_gaps(paths: Sequence[str]) -> None:
         previous_last = last if last is not None else previous_last
 
 
-def filter_compatible_scanimage_files(paths: Sequence[str]) -> list[str]:
-    """Return the subset of `paths` that share the same static ScanImage configuration.
+def _scanimage_structural_signature(tif: TiffFile) -> tuple[Any, ...]:
+    """Return the subset of a ScanImage file's properties that matter for concatenation.
 
-    The first path that can be opened as a ScanImage file becomes the
-    reference; every other path is kept only if its own FrameData matches
-    the reference exactly (ignoring `_PER_FILE_FRAMEDATA_KEYS`, which
-    legitimately vary between files of the same acquisition). This is a
-    strict, whole-metadata comparison rather than checking only the
-    fields `_compute_scanimage_structure` happens to use today, so it
-    also catches unexpected future differences. Non-ScanImage or
-    unreadable paths, and paths whose metadata differs from the
-    reference, are dropped (with a warning) rather than risking a wrong
-    reshape; order is preserved for whatever remains. Used both for
-    filename-based sibling auto-discovery (`find_scanimage_series_files`)
-    and for an explicit multi-file selection (`napari_tiff_reader.
-    scanimage_reader_function`).
+    Two files can be safely stitched together if (and only if) they agree
+    on this signature - the shape one timepoint implies
+    (`_compute_scanimage_structure`) plus the raw page geometry
+    (`build_scanimage_layerdata` reshapes every file's pages using the
+    *first* file's structure, so a Y/X or dtype mismatch would silently
+    corrupt the result). Deliberately *not* full FrameData equality:
+    many fields legitimately drift between files of the very same real
+    acquisition without indicating any structural difference - e.g. a
+    resonant scanner's actually-measured frequency (and everything
+    derived from it: line/frame period, frame/volume rate, the per-line
+    pixel mask), or per-file PMT/detector offset recalibration - and
+    chasing those down field-by-field as they're discovered doesn't
+    scale. Raises if the file can't be interpreted as ScanImage at all.
     """
-    reference_framedata = None
+    if not tif.is_scanimage:
+        raise ValueError("not a ScanImage file")
+    framedata = get_scanimage_framedata(tif)
+    structure = _compute_scanimage_structure(framedata)
+    if structure.warning:
+        raise ValueError(structure.warning)
+    page0 = tif.pages[0]
+    return (
+        structure.axes,
+        structure.pages_per_step,
+        structure.z_count,
+        structure.frames_per_slice,
+        structure.n_channels,
+        structure.log_average_factor,
+        page0.shape,
+        str(page0.dtype),
+    )
+
+
+def filter_compatible_scanimage_files(paths: Sequence[str]) -> list[str]:
+    """Return the subset of `paths` structurally compatible for concatenation.
+
+    The first path that yields a valid structural signature (see
+    `_scanimage_structural_signature`) becomes the reference; every other
+    path is kept only if its own signature matches. Non-ScanImage,
+    unreadable, or structurally-uninterpretable paths, and paths whose
+    signature differs from the reference, are dropped (with a warning)
+    rather than risking a wrong reshape; order is preserved for whatever
+    remains. Used both for filename-based sibling auto-discovery
+    (`find_scanimage_series_files`) and for an explicit multi-file
+    selection (`napari_tiff_reader.scanimage_reader_function`).
+    """
+    reference_signature = None
     confirmed = []
     for candidate in paths:
         try:
             with TiffFile(candidate) as tif:
-                if not tif.is_scanimage:
-                    log_warning(
-                        f"{candidate!r} is not a ScanImage file; excluding it "
-                        "from the combined acquisition"
-                    )
-                    continue
-                framedata = _comparable_framedata(get_scanimage_framedata(tif))
+                signature = _scanimage_structural_signature(tif)
         except Exception as exc:
-            log_warning(f"failed to inspect potential ScanImage file {candidate!r}: {exc}")
+            log_warning(
+                f"{candidate!r} could not be matched to the rest of this "
+                f"selection ({exc}); excluding it from the combined acquisition"
+            )
             continue
 
-        if reference_framedata is None:
-            reference_framedata = framedata
+        if reference_signature is None:
+            reference_signature = signature
             confirmed.append(candidate)
-        elif framedata == reference_framedata:
+        elif signature == reference_signature:
             confirmed.append(candidate)
         else:
             log_warning(
-                f"{candidate!r} has ScanImage metadata that differs from the "
-                "rest of this selection (e.g. channels, volume/frame "
-                "structure, or acquisition settings); excluding it from the "
-                "combined acquisition"
+                f"{candidate!r} has a different structure (planes, channels, "
+                "frame-averaging, or frame size/dtype) than the rest of this "
+                "selection; excluding it from the combined acquisition"
             )
 
     return confirmed

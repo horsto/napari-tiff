@@ -20,6 +20,9 @@ SCANIMAGE_SOFTWARE_FRAMES_PER_SLICE_1VOL = (
 SCANIMAGE_SOFTWARE_LOG_AVERAGE = (
     SCANIMAGE_DATA_DIR / "software_log_average.txt"
 ).read_text()
+SCANIMAGE_SOFTWARE_SPLIT_DRIFT = (
+    SCANIMAGE_DATA_DIR / "software_split_drift.txt"
+).read_text()
 
 
 def example_data_filepath(tmp_path, original_data):

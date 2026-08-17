@@ -8,6 +8,7 @@ from tifffile import TiffFile
 from base_data import (
     SCANIMAGE_SOFTWARE_SINGLE,
     SCANIMAGE_SOFTWARE_SPLIT,
+    SCANIMAGE_SOFTWARE_SPLIT_DRIFT,
     scanimage_flat_two_channel_tiff,
     scanimage_frames_per_slice_multivolume_tiff,
     scanimage_frames_per_slice_single_volume_tiff,
@@ -470,6 +471,23 @@ def test_reader_explicit_list_excludes_incompatible_file_and_opens_it_independen
 
     independent = next(ld for ld in layer_data_list if ld[0].shape == (5, 4, 4))
     assert_array_equal(independent[0].compute(), data3)
+
+
+def test_filter_compatible_scanimage_files_ignores_scanner_timing_drift(tmp_path):
+    """Regression test for a real-world case: two genuinely compatible
+    split-acquisition files whose resonant scanner frequency (and
+    everything derived from it - line/frame period, frame/volume rate,
+    the per-line pixel mask) and PMT offsets drifted slightly between
+    files, as real hardware always does. These fields must not be
+    mistaken for a structural incompatibility.
+    """
+    path1 = tmp_path / "acq_00005_00001.tif"
+    path2 = tmp_path / "acq_00005_00002.tif"
+    write_scanimage_tiff(path1, SCANIMAGE_SOFTWARE_SPLIT, n_pages=8, start_frame_number=1)
+    write_scanimage_tiff(path2, SCANIMAGE_SOFTWARE_SPLIT_DRIFT, n_pages=8, start_frame_number=9)
+
+    result = filter_compatible_scanimage_files([str(path1), str(path2)])
+    assert result == [str(path1), str(path2)]
 
 
 def test_filter_compatible_scanimage_files_keeps_only_matching_metadata(tmp_path):
