@@ -10,6 +10,7 @@ Replace code below accordingly.  For complete documentation see:
 https://napari.org/docs/plugins/for_plugin_developers.html
 """
 import os
+from pathlib import Path
 import dask.array as da
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
@@ -125,6 +126,27 @@ def reader_function(path: PathLike) -> List[LayerData]:
     return layerdata
 
 
+def _apply_stitched_layer_name(metadata_kwargs: Dict[str, Any], paths: List[str]) -> None:
+    """Name a combined layer to reflect that it was stitched, not just the first file.
+
+    Without this, napari would default the layer's display name to just
+    the first file's own filename, which is misleading once other files'
+    data has been concatenated in - there's no indication anything was
+    combined. Only touches `name` when more than one file actually went
+    into the combination; leaves per-channel name lists (set when
+    `channel_axis` is present) as distinct entries, just with the same
+    suffix appended to each.
+    """
+    if len(paths) <= 1:
+        return
+    suffix = f" (stitched, {len(paths)} files)"
+    existing_name = metadata_kwargs.get("name")
+    if isinstance(existing_name, list):
+        metadata_kwargs["name"] = [f"{name}{suffix}" for name in existing_name]
+    else:
+        metadata_kwargs["name"] = f"{Path(paths[0]).stem}{suffix}"
+
+
 def scanimage_reader_function(path: PathLike) -> List[LayerData]:
     """Return napari LayerData for a ScanImage acquisition.
 
@@ -146,6 +168,7 @@ def scanimage_reader_function(path: PathLike) -> List[LayerData]:
             framedata = get_scanimage_framedata(tif)
             dims = compute_scanimage_dimensions(framedata, len(tif.pages))
             metadata_kwargs = get_metadata(tif)
+        _apply_stitched_layer_name(metadata_kwargs, paths)
 
         data, _axes = build_scanimage_layerdata(paths, dims)
         return [(data, metadata_kwargs, "image")]
@@ -185,6 +208,7 @@ def _scanimage_reader_for_explicit_list(paths: List[str]) -> List[LayerData]:
                 framedata = get_scanimage_framedata(tif)
                 dims = compute_scanimage_dimensions(framedata, len(tif.pages))
                 metadata_kwargs = get_metadata(tif)
+            _apply_stitched_layer_name(metadata_kwargs, compatible)
             data, _axes = build_scanimage_layerdata(compatible, dims)
             layers.append((data, metadata_kwargs, "image"))
         except Exception as exc:

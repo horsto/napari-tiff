@@ -382,10 +382,12 @@ def test_reader_explicit_full_set(scanimage_split_files):
 
 def test_reader_explicit_noncontiguous_subset_warns(scanimage_split_files):
     """Selecting files 1 and 3 (skipping 2) should still stitch correctly,
-    but log a warning about the frame-number gap.
+    but log a warning about the frame-number gap: frame 8 is followed by
+    17, neither continuing (9) nor restarting a new acquisition (1), so
+    this really does look like a missing chunk of the same acquisition.
     """
     paths, datas = scanimage_split_files
-    with pytest.warns(UserWarning, match="not contiguous"):
+    with pytest.warns(UserWarning, match="missing a chunk"):
         layer_data_list = scanimage_reader_function([paths[0], paths[2]])
     result, _kwargs, _ = layer_data_list[0]
     expected = np.concatenate(
@@ -415,11 +417,9 @@ def test_reader_explicit_list_with_truncated_file_still_concatenates(tmp_path):
         z_group_size=4,
         n_channels=1,
     )
-    # the truncated file's frame numbers restart at 1 rather than
-    # continuing from file 1's - expected here, and unrelated to whether
-    # concatenation itself works correctly
-    with pytest.warns(UserWarning, match="not contiguous"):
-        layer_data_list = scanimage_reader_function([str(path1), str(path2)])
+    # the truncated file's frame numbers restart at 1 - treated as a new,
+    # separate acquisition rather than a gap, so no warning is expected
+    layer_data_list = scanimage_reader_function([str(path1), str(path2)])
     assert len(layer_data_list) == 1
     result, kwargs, _layer_type = layer_data_list[0]
     assert result.shape == (4, 3, 4, 4)  # 2 complete volumes from each file
@@ -471,6 +471,31 @@ def test_reader_explicit_list_excludes_incompatible_file_and_opens_it_independen
 
     independent = next(ld for ld in layer_data_list if ld[0].shape == (5, 4, 4))
     assert_array_equal(independent[0].compute(), data3)
+
+
+def test_reader_explicit_list_names_layer_as_stitched(tmp_path):
+    """A combined multi-file layer's name must reflect that it was
+    stitched together - not just look like the first file's own name,
+    which would hide that other files' data was merged in.
+    """
+    path1 = tmp_path / "acq_00006_00001.tif"
+    path2 = tmp_path / "acq_00006_00002.tif"
+    write_scanimage_tiff(path1, SCANIMAGE_SOFTWARE_SPLIT, n_pages=8, start_frame_number=1)
+    write_scanimage_tiff(path2, SCANIMAGE_SOFTWARE_SPLIT, n_pages=8, start_frame_number=9)
+
+    layer_data_list = scanimage_reader_function([str(path1), str(path2)])
+    assert len(layer_data_list) == 1
+    _result, kwargs, _layer_type = layer_data_list[0]
+    assert kwargs["name"] == "acq_00006_00001 (stitched, 2 files)"
+
+
+def test_reader_single_file_does_not_rename_layer(scanimage_timeseries_tiff):
+    """A single file (nothing stitched) keeps napari's default naming
+    (derived from the file path) - no `name` override needed or wanted.
+    """
+    path, _data = scanimage_timeseries_tiff
+    _result, kwargs, _layer_type = scanimage_reader_function(path)[0]
+    assert "name" not in kwargs
 
 
 def test_filter_compatible_scanimage_files_ignores_scanner_timing_drift(tmp_path):

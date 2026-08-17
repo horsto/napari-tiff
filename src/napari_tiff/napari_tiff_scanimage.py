@@ -330,10 +330,16 @@ def _frame_number(page: Any) -> int | None:
 
 
 def warn_on_frame_number_gaps(paths: Sequence[str]) -> None:
-    """Log a warning if selected files are not a contiguous timeline.
+    """Log a warning if selected files look like a partial split acquisition.
 
-    This is advisory only: users may intentionally select a partial or
-    non-contiguous subset of a split acquisition's files.
+    A file whose first frame number restarts at 1 is treated as starting
+    its own, separate acquisition - completely normal (e.g. combining
+    several independent recordings that happen to share the same
+    acquisition settings), not a gap. Only a frame number that neither
+    continues the previous file (`previous_last + 1`) nor restarts at 1
+    suggests an actual missing chunk of the *same* split acquisition
+    (e.g. a file skipped when selecting a subset), which is worth
+    flagging. This is advisory only either way.
     """
     previous_last = None
     for path in paths:
@@ -343,11 +349,17 @@ def warn_on_frame_number_gaps(paths: Sequence[str]) -> None:
                 last = _frame_number(tif.pages[-1])
         except Exception:
             return
-        if previous_last is not None and first is not None and first != previous_last + 1:
+        if (
+            previous_last is not None
+            and first is not None
+            and first != previous_last + 1
+            and first != 1
+        ):
             warnings.warn(
-                f"selected ScanImage files are not contiguous: frame "
-                f"{previous_last} is followed by frame {first} at {path!r} "
-                "- the combined timeline will have a gap"
+                f"selected ScanImage files may be missing a chunk of the same "
+                f"split acquisition: frame {previous_last} is followed by "
+                f"frame {first} at {path!r} - the combined timeline will "
+                "have a gap"
             )
         previous_last = last if last is not None else previous_last
 
